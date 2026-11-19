@@ -10,6 +10,8 @@ Usage: ${script_name} [run] [--profile NAME]
        ${script_name} build [--no-cache]
        ${script_name} profile list
        ${script_name} profile build [--no-cache] NAME...
+       ${script_name} profile use NAME GENERATION
+       ${script_name} profile revert NAME
        ${script_name} tool list [--profile NAME]
        ${script_name} tool build [--profile NAME] NAME...
        ${script_name} clean [--dry-run] TARGET...
@@ -29,6 +31,10 @@ Commands:
                           images, marking the latest
   profile build NAME...   Build or update the image of each profile NAME
                           from profiles/NAME/Dockerfile, as a generation
+  profile use NAME GENERATION
+                          Mark generation GENERATION of profile NAME latest
+  profile revert NAME     Mark latest the generation of profile NAME before
+                          the one latest marks
   tool list               List the tools and whether each is built for
                           the profile of --profile, else that of
                           DOCKERED_CLAUDE_PROFILE
@@ -171,8 +177,8 @@ Profiles:
   :2 and so on, and latest is moved to it; runs use the image that latest
   marks. A build that gives the image of an existing generation, as one
   taken wholly from the build cache does, adds none and marks that one
-  latest. To go back to an earlier generation, mark it latest:
-  docker tag dockered-claude-NAME:GENERATION dockered-claude-NAME:latest
+  latest. profile use and profile revert mark another generation latest,
+  newer ones included, which stay until cleaned.
   An image built by an earlier version of the launcher is tagged as a
   generation when the launcher next uses or rebuilds it.
 
@@ -411,7 +417,9 @@ parse_build_arguments() {
 # Set kwargs[command] to GROUP-list or GROUP-build,
 # and args to the names to build,
 # for the commands GROUP list and GROUP build NAME...,
-# where GROUP names its validate_GROUP_name function.
+# where GROUP names its validate_GROUP_name function;
+# or, for profile use NAME GENERATION and profile revert NAME,
+# to profile-use or profile-revert, and args to those arguments.
 # The tool commands also take --profile NAME,
 # and profile build takes --no-cache, setting kwargs[no_cache].
 parse_group_arguments() {
@@ -423,6 +431,13 @@ parse_group_arguments() {
     return 0
     ;;
   list | build) command="$1" ;;
+  use | revert)
+    if [[ "${group}" != profile ]]; then
+      warn "unknown ${group} command '$1'"
+      return 1
+    fi
+    command="$1"
+    ;;
   '')
     warn "${group} requires list or build"
     return 1
@@ -465,15 +480,37 @@ parse_group_arguments() {
         warn "${group} list: unexpected argument '${argument}'"
         return 1
       fi
-      "validate_${group}_name" "${argument}" || return
+      if [[ "${command}" == use ]] && ((${#args[@]} == 1)); then
+        validate_generation "${argument}" || return
+      else
+        "validate_${group}_name" "${argument}" || return
+      fi
       args+=("${argument}")
       ;;
     esac
   done
+  [[ -z "${kwargs[help]+defined}" ]] || return 0
+
+  if [[ "${command}" == use ]] && ((${#args[@]} != 2)); then
+    warn "profile use requires a profile name and a generation"
+    return 1
+  fi
+  if [[ "${command}" == revert ]] && ((${#args[@]} != 1)); then
+    warn "profile revert requires one profile name"
+    return 1
+  fi
 
   if [[ "${command}" == build ]] && ((${#args[@]} == 0)) &&
     [[ -z "${kwargs[help]+defined}" ]]; then
     warn "${group} build requires a ${group} name"
+    return 1
+  fi
+}
+
+validate_generation() {
+  declare generation="$1"
+  if [[ ! "${generation}" =~ ^[1-9][0-9]*$ ]]; then
+    warn "invalid generation '${generation}'"
     return 1
   fi
 }
@@ -1475,10 +1512,51 @@ ensure_image() {
   fi
   if ((${#profile_generations[@]} > 0)); then
     warn "no generation of profile '${profile}' is marked latest;" \
-      "mark one with: docker tag ${image%:*}:GENERATION ${image}"
+      "mark one with: ${script_name} profile use ${profile} GENERATION"
     return 1
   fi
   build_image
+}
+
+# Mark generation GENERATION of the profile latest.
+use_profile_generation() {
+  declare wanted="$1" latest_id
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
+  find_profile_generations || return
+  if [[ -z "${generation_ids[${wanted}]+defined}" ]]; then
+    warn "profile '${profile}' has no generation ${wanted}"
+    return 1
+  fi
+  docker tag "${generation_ids[${wanted}]}" "${image}" || return
+  warn "marked generation ${wanted} of profile '${profile}' latest"
+}
+
+# Mark latest the newest generation of the profile
+# below the one that latest marks,
+# adopting an image from an earlier version of the launcher first,
+# so that it can be marked again.
+revert_profile() {
+  declare latest_id generation candidate previous=''
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
+  find_profile_generations || return
+  adopt_latest_image || return
+  find_generation_of "${latest_id}"
+  if [[ -z "${generation}" ]]; then
+    warn "no generation of profile '${profile}' is marked latest"
+    return 1
+  fi
+  for candidate in "${profile_generations[@]}"; do
+    ((candidate >= generation)) || previous="${candidate}"
+  done
+  if [[ -z "${previous}" ]]; then
+    warn "profile '${profile}' has no generation before ${generation}"
+    return 1
+  fi
+  docker tag "${generation_ids[${previous}]}" "${image}" || return
+  warn "marked generation ${previous} of profile '${profile}' latest," \
+    "instead of ${generation}"
 }
 
 # Run containers from an image with the selected packages
@@ -2180,6 +2258,16 @@ run() {
     ;;
   profile-list)
     list_profiles
+    return
+    ;;
+  profile-use | profile-revert)
+    check_profile_defined "${args[0]}" || return
+    set_profile "${args[0]}"
+    if [[ "${kwargs[command]}" == profile-use ]]; then
+      use_profile_generation "${args[1]}"
+    else
+      revert_profile
+    fi
     return
     ;;
   profile-build)

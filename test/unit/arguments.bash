@@ -268,6 +268,42 @@ test_profile_build_requires_a_valid_name() {
   assert_contains "${errors}" "invalid profile name '../escape'"
 }
 
+test_profile_use_takes_a_name_and_a_generation() {
+  reset_arguments
+  capture parse_arguments profile use default 3
+  assert_status 0
+  assert_equal profile-use "${kwargs[command]}"
+  assert_array args default 3
+
+  for arguments in 'default' 'default 3 4' 'default x'; do
+    reset_arguments
+    # shellcheck disable=SC2086 # Split into arguments.
+    capture parse_arguments profile use ${arguments}
+    assert_status 1
+  done
+  assert_contains "${errors}" "invalid generation 'x'"
+}
+
+test_profile_revert_takes_one_name() {
+  reset_arguments
+  capture parse_arguments profile revert default
+  assert_status 0
+  assert_equal profile-revert "${kwargs[command]}"
+  assert_array args default
+
+  reset_arguments
+  capture parse_arguments profile revert
+  assert_status 1
+  assert_contains "${errors}" 'profile revert requires one profile name'
+}
+
+test_tools_have_no_use_or_revert_yet() {
+  reset_arguments
+  capture parse_arguments tool revert uv
+  assert_status 1
+  assert_contains "${errors}" "unknown tool command 'revert'"
+}
+
 test_tool_commands_take_a_profile() {
   reset_arguments
   capture parse_arguments tool list --profile minimal
