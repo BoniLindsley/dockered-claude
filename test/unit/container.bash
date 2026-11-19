@@ -130,8 +130,8 @@ reset_managed_settings() {
   agents_dir="${HOME}/.agents"
   config_dir="${HOME}/.config/claude"
   git_config_dir="${HOME}/.config/git"
-  declare -ga run_links=()
-  declare -gA link_targets=()
+  declare -ga run_links=() persisted_paths=()
+  declare -gA link_targets=() persisted_bases=()
   username=claude
   groupname=staff
   uid_host=1000
@@ -272,7 +272,8 @@ FROM \${BASE_IMAGE_ID}
 ADD run.tar /
 -rw-r--r-- 0/0 etc/passwd
 -rw-r--r-- 0/0 etc/group
-drwx------ 1000/1001 ${home#/}/"
+drwx------ 1000/1001 ${home#/}/
+drwxr-xr-x 1000/1001 ${home#/}/.config/"
   [[ "${output}" != *etc/passwd* && "${output}" != *etc/group* ]] ||
     fail "expected no mount of /etc files: ${output}"
 }
@@ -318,6 +319,7 @@ test_the_run_image_adds_the_links_after_the_home_directories() {
   assert_equal "-rw-r--r-- 0/0 etc/passwd
 -rw-r--r-- 0/0 etc/group
 drwx------ 1000/1001 ${home#/}/
+drwxr-xr-x 1000/1001 ${home#/}/.config/
 drwxr-xr-x 1000/1001 ${home#/}/a/
 drwxr-xr-x 1000/1001 ${home#/}/a/b/
 lrwxrwxrwx 0/0 ${home#/}/src -> /data/src
@@ -325,11 +327,43 @@ lrwxrwxrwx 0/0 1/2 -> /b
 lrwxrwxrwx 0/0 ${home#/}/a/b/c -> ../../x" "$(sed 1,3d -- "${build}")"
 }
 
-test_claude_codes_state_is_mounted_from_the_tools_state() {
+test_persisted_paths_are_mounted_from_the_state_over_a_cache_tmpfs() {
   reset_managed_settings
+  persisted_paths=(.claude .cache/uv .config/rclone)
+  persisted_bases=(
+    [".claude"]="${state_dir}/tools/claude-code"
+    [".cache/uv"]="${state_dir}/tools/uv"
+    [".config/rclone"]="${state_dir}/tools/rclone"
+  )
   capture_run_container
   assert_status 0
   assert_contains "${output}" "CLAUDE_CONFIG_DIR=${home}/.claude"
-  assert_contains "${output}" \
-    "type=bind,src=${claude_state},dst=${home}/.claude"
+  assert_contains "${output}" "--tmpfs
+${home}/.cache:rw,exec,nosuid,nodev,uid=1000,gid=1001,mode=0700"
+  assert_contains "${output}" "--mount
+type=bind,src=${claude_state},dst=${home}/.claude
+--mount
+type=bind,src=${state_dir}/tools/uv/.cache/uv,dst=${home}/.cache/uv
+--mount
+type=bind,src=${state_dir}/tools/rclone/.config/rclone,dst=${home}/.config/rclone"
+  [[ "${output}" != *dst=/home$'\n'* ]] || fail "expected no /home mount"
+}
+
+test_the_run_image_makes_the_directories_above_mount_points_in_the_home() {
+  reset_managed_settings
+  workdir="${home}/src/project"
+  mount_paths=("${home}/notes/today" /srv/data)
+  mount_modes=(["${home}/notes/today"]=ro ["/srv/data"]=ro)
+  persisted_paths=(.local/share/uv)
+  persisted_bases=([".local/share/uv"]="${state_dir}/tools/uv")
+  capture_run_container
+  assert_status 0
+  assert_equal "-rw-r--r-- 0/0 etc/passwd
+-rw-r--r-- 0/0 etc/group
+drwx------ 1000/1001 ${home#/}/
+drwxr-xr-x 1000/1001 ${home#/}/.config/
+drwxr-xr-x 1000/1001 ${home#/}/.local/
+drwxr-xr-x 1000/1001 ${home#/}/.local/share/
+drwxr-xr-x 1000/1001 ${home#/}/notes/
+drwxr-xr-x 1000/1001 ${home#/}/src/" "$(sed 1,3d -- "${build}")"
 }

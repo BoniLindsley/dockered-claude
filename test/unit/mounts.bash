@@ -16,6 +16,7 @@ reset_mounts() {
   declare -gA kwargs=() mount_modes=()
   declare -gA mount_given_paths=() link_targets=() link_climbs=()
   declare -ga mounts=() project_mounts=() mount_paths=() link_paths=()
+  declare -ga persisted_paths=(.claude .cache/uv)
   home=/home/someone
   workdir=/home/someone/project
   project_root="${workdir}"
@@ -231,6 +232,22 @@ test_checking_refuses_what_the_launcher_mounts() {
   assert_contains "${errors}" 'it would replace /home/someone/.agents'
 }
 
+test_checking_refuses_a_persisted_path_inside_the_cache() {
+  reset_mounts
+  capture check_mount_path /home/someone/.cache/uv
+  assert_status 1
+  assert_contains "${errors}" 'it would replace /home/someone/.cache/uv'
+}
+
+test_checking_refuses_the_cache_but_allows_inside_it() {
+  reset_mounts
+  capture check_mount_path /home/someone/.cache
+  assert_status 1
+  assert_contains "${errors}" "it would replace the run's own ~/.cache"
+  capture check_mount_path /home/someone/.cache/pip
+  assert_status 0
+}
+
 test_checking_allows_a_parent_of_what_the_launcher_mounts() {
   reset_mounts
   capture check_mount_path /home/someone/.config
@@ -316,7 +333,8 @@ test_links_at_inside_or_above_reserved_paths_are_refused() {
   reset_mounts
   link_paths=(
     /opt /usr/lib64 /home /home/someone /home/someone/.config
-    /home/someone/.claude/projects /home/someone/src /srv/data
+    /home/someone/.claude/projects /home/someone/.cache/pip
+    /home/someone/src /srv/data
   )
   capture select_run_links
   assert_status 0
@@ -326,6 +344,7 @@ ${script_name}: not making the symbolic link '/usr/lib64' in the container: it i
 ${script_name}: not making the symbolic link '/home' in the container: it is at, inside or above /home/someone/.claude
 ${script_name}: not making the symbolic link '/home/someone' in the container: it is at, inside or above /home/someone/.claude
 ${script_name}: not making the symbolic link '/home/someone/.config' in the container: it is at, inside or above /home/someone/.config/claude
-${script_name}: not making the symbolic link '/home/someone/.claude/projects' in the container: it is at, inside or above /home/someone/.claude" \
+${script_name}: not making the symbolic link '/home/someone/.claude/projects' in the container: it is at, inside or above /home/someone/.claude
+${script_name}: not making the symbolic link '/home/someone/.cache/pip' in the container: it is at, inside or above /home/someone/.cache" \
     "${errors}"
 }

@@ -105,8 +105,8 @@ test_preparing_the_state_makes_it_private_to_the_user() {
   reset_state
   capture prepare_state_directory
   assert_status 0
-  [[ -d "${claude_state}/skills" && -d "${state_home}" ]] ||
-    fail "expected the state directories"
+  [[ -d "${claude_state}/skills" ]] || fail "expected the state directories"
+  [[ ! -e "${state_dir}/home" ]] || fail "expected no home in the state"
   assert_equal 700 "$(stat -c %a -- "${claude_state}")"
   assert_equal 700 "$(stat -c %a -- "${state_dir}/tools")"
 }

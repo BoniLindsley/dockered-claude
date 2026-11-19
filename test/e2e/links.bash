@@ -50,7 +50,7 @@ test_links_on_a_mount_path_are_made_and_the_images_files_kept() {
   : >"${base}/f/host-file"
   build_base_image "${base}/1" "${base}/b/3" "${base}/d/5"
 
-  declare -a link_paths=() run_links=() mount_paths=("${base}/f")
+  declare -a link_paths=() run_links=() mount_paths=("${base}/f") persisted_paths=()
   declare -A link_targets=() link_climbs=()
   declare traced_path run_image
   uid_host="$(id -u)"

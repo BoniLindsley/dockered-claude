@@ -619,8 +619,7 @@ resolve_paths() {
   username="$(id -un)" || return
   groupname="$(id -gn)" || return
 
-  # The container home lives under the mounted /home tree, so the
-  # username-specific directory does not need to exist in the read-only image.
+  # The run image makes the home, with only the persisted paths mounted in it.
   home="/home/${username}"
   state_dir="${DOCKERED_CLAUDE_HOME:-${XDG_STATE_HOME:-${HOME:?}/.local/state}/dockered-claude}"
   state_home="${state_dir}/home/${username}"
@@ -903,7 +902,7 @@ warn_missing_climbed_directories() {
 # not those inside a mount, the working directory included,
 # where the host's own link is visible already,
 # nor, with a warning, those at, inside or above a reserved path
-# or at or above the home,
+# or ~/.cache, or at or above the home,
 # which would replace or hide what the image or the launcher puts there;
 # the mount still goes ahead at the resolved path.
 select_run_links() {
@@ -915,7 +914,8 @@ select_run_links() {
     for path in "${workdir}" "${mount_paths[@]}"; do
       [[ "${link}" != "${path%/}/"* ]] || continue 2
     done
-    for reserved in "${hidden_paths[@]}" "${mounted_paths[@]}" "${home}"; do
+    for reserved in "${hidden_paths[@]}" "${mounted_paths[@]}" \
+      "${home}/.cache" "${home}"; do
       if [[ "${link}" == "${reserved}" || "${link}" == "${reserved}/"* ||
         "${reserved}" == "${link}/"* ]]; then
         if [[ "${reserved}" == "${home}" && "${link}" == "${home}/"* ]]; then
@@ -931,14 +931,17 @@ select_run_links() {
 }
 
 # Set hidden_paths to the paths that the image needs
-# or that hold Claude Code's state in the persisted home,
+# and the persisted home paths, in the container,
 # and mounted_paths to those the launcher mounts itself.
 set_reserved_paths() {
+  declare path
   hidden_paths=(
     /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /opt/tools /proc /run
     /sbin /sys /tmp /usr /var
-    "${home}/.claude"
   )
+  for path in "${persisted_paths[@]}"; do
+    hidden_paths+=("${home}/${path}")
+  done
   mounted_paths=(
     "${home}/.agents"
     "${home}/.config/claude"
@@ -947,11 +950,13 @@ set_reserved_paths() {
 }
 
 # Refuse a mount at, inside or above a path that the image needs
-# or that holds Claude Code's state in the persisted home,
+# or a persisted home path,
 # since it would hide or replace them;
 # at or inside a path the launcher mounts itself,
 # since that mount is on top
 # (a mount above one is fine, the launcher's mount is on top of it);
+# at ~/.cache, where the launcher mounts a tmpfs
+# (inside it is fine, the mount is on top of the tmpfs);
 # at the working directory, which is mounted already;
 # or at or inside the launcher's configuration,
 # which must stay read-only in the container.
@@ -965,6 +970,10 @@ check_mount_path() {
       return 1
     fi
   done
+  if [[ "${path}" == "${home}/.cache" ]]; then
+    warn "cannot mount '${path}': it would replace the run's own ~/.cache"
+    return 1
+  fi
   for reserved in "${hidden_paths[@]}"; do
     if [[ "${reserved}" == "${path%/}/"* ]]; then
       warn "cannot mount '${path}': it would hide ${reserved}"
@@ -1108,6 +1117,145 @@ read_profile_launcher() {
       return 1
     fi
     profile_path_entries+=("${line}")
+  done
+}
+
+# Set home_path and home_kind from a persisted home path
+# given as PATH, a file, or PATH/, a directory,
+# relative to ~ and normalized, as docker's --mount option can take it.
+validate_home_path() {
+  declare spec="$1"
+  home_path="${spec%/}"
+  home_kind='file'
+  [[ "${spec}" != */ ]] || home_kind=directory
+  declare wrapped="/${home_path}/"
+  if [[ -z "${home_path}" || "${wrapped}" == *//* ||
+    "${wrapped}" == */./* || "${wrapped}" == */../* ||
+    "${home_path}" == *[,\"$'\n']* ]]; then
+    warn "invalid home path '${spec}': it must be relative to ~, normalized," \
+      "without '..', and contain no commas or double quotes"
+    return 1
+  fi
+}
+
+# Add the persisted home path SPEC, as validate_home_path takes it,
+# to persisted_paths, stored under BASE on the host,
+# with its kind, base and SOURCE, which names it in messages,
+# in persisted_kinds, persisted_bases and persisted_sources.
+# Refuse it at, inside or above another persisted path (D11 of the design),
+# or a path the launcher mounts itself, which would be on top of it,
+# or at ~/.cache, where the launcher mounts a tmpfs.
+add_persisted_path() {
+  declare spec="$1" base="$2" source="$3" home_path home_kind path other
+  declare -a hidden_paths mounted_paths
+  if ! validate_home_path "${spec}"; then
+    warn "${source}: invalid home path"
+    return 1
+  fi
+  path="${home}/${home_path}"
+  if [[ "${home_path}" == .cache ]]; then
+    warn "${source}: cannot persist ${path}: the launcher mounts a tmpfs there"
+    return 1
+  fi
+  for other in "${persisted_paths[@]}"; do
+    if [[ "${home_path}" == "${other}" || "${home_path}" == "${other}/"* ||
+      "${other}" == "${home_path}/"* ]]; then
+      warn "${source}: cannot persist ${path}: it is at, inside or above" \
+        "${home}/${other}, persisted by ${persisted_sources["${other}"]}"
+      return 1
+    fi
+  done
+  set_reserved_paths
+  for other in "${mounted_paths[@]}"; do
+    if [[ "${path}" == "${other}" || "${path}" == "${other}/"* ||
+      "${other}" == "${path}/"* ]]; then
+      warn "${source}: cannot persist ${path}: it is at, inside or above" \
+        "${other}, which the launcher mounts"
+      return 1
+    fi
+  done
+  persisted_paths+=("${home_path}")
+  persisted_kinds["${home_path}"]="${home_kind}"
+  persisted_bases["${home_path}"]="${base}"
+  persisted_sources["${home_path}"]="${source}"
+}
+
+# Set persisted_paths, in order, to the persisted home paths of this run,
+# as add_persisted_path does:
+# those in the home file of each tool in mounted_tools,
+# stored in tools/<tool> of the state directory;
+# then those that profile_home of the profile's launcher.bash prints,
+# stored in profiles/<profile>.
+# A home file has a path per line, and blank lines and # comments.
+select_persisted_paths() {
+  declare tool file line
+  declare skip='^[[:space:]]*(#|$)'
+  declare -a lines
+  declare -A seen=()
+  for tool in "${mounted_tools[@]}"; do
+    [[ -z "${seen[${tool}]+defined}" ]] || continue
+    seen[${tool}]=1
+    file="${project_directory}/tools/${tool}/home"
+    [[ -f "${file}" ]] || continue
+    mapfile -t lines <"${file}" || return
+    for line in "${lines[@]}"; do
+      [[ ! "${line}" =~ ${skip} ]] || continue
+      add_persisted_path "${line}" "${state_dir}/tools/${tool}" "${file}" ||
+        return
+    done
+  done
+
+  read_profile_function profile_home || return
+  for line in "${lines[@]}"; do
+    add_persisted_path "${line}" "${state_dir}/profiles/${profile}" \
+      "${project_directory}/profiles/${profile}/launcher.bash: profile_home" ||
+      return
+  done
+}
+
+# Refuse a working directory at, inside or above a persisted home path,
+# since one of them would be mounted on top of the other.
+check_working_directory() {
+  declare path
+  for path in "${persisted_paths[@]}"; do
+    path="${home}/${path}"
+    if [[ "${workdir}" == "${path}" || "${workdir}" == "${path}/"* ||
+      "${path}" == "${workdir%/}/"* ]]; then
+      warn "cannot run in '${workdir}': it is at, inside or above" \
+        "${path}, which is persisted in the launcher's state"
+      return 1
+    fi
+  done
+}
+
+# Create each persisted home path under its base in the state directory,
+# a directory or an empty file, leaving what is there,
+# with the base and the directory above it readable only by the user.
+# Fail when what is there is of the other kind,
+# since docker cannot mount a directory on a file or a file on a directory.
+prepare_persisted_paths() {
+  declare path base source
+  for path in "${persisted_paths[@]}"; do
+    base="${persisted_bases["${path}"]}"
+    source="${base}/${path}"
+    mkdir -p -- "${base}" || return
+    chmod 700 -- "${base%/*}" "${base}" || return
+    if [[ "${persisted_kinds["${path}"]}" == directory ]]; then
+      [[ ! -d "${source}" ]] || continue
+      if [[ -e "${source}" || -L "${source}" ]]; then
+        warn "cannot persist ${home}/${path}: ${source} is not a directory"
+        return 1
+      fi
+      mkdir -p -- "${source}" || return
+    else
+      [[ ! -f "${source}" ]] || continue
+      if [[ -e "${source}" || -L "${source}" ]]; then
+        warn "cannot persist ${home}/${path}: ${source} is not a file"
+        return 1
+      fi
+      mkdir -p -- "${source%/*}" || return
+      : >"${source}" || return
+    fi
   done
 }
 
@@ -1547,9 +1695,9 @@ list_profiles() {
 # Create the state directory, with Claude Code's state in claude_state,
 # readable only by the user.
 prepare_state_directory() {
-  mkdir -p -- "${state_home}" "${claude_state}/skills" || return
-  chmod 700 -- "${state_dir}" "${state_dir}/home" "${state_home}" \
-    "${state_dir}/tools" "${claude_state%/*}" "${claude_state}" || return
+  mkdir -p -- "${claude_state}/skills" || return
+  chmod 700 -- "${state_dir}" "${state_dir}/tools" "${claude_state%/*}" \
+    "${claude_state}" || return
 }
 
 # Succeed when PATH is a directory with nothing in it.
@@ -1624,57 +1772,6 @@ migrate_state() {
     mv -- "${path}" "${destination}" || return
     warn "moved ${path} to ${destination}"
   done <<<"${paths}"
-}
-
-# Docker creates missing mount points as root. Under /home, which is the
-# persisted state directory, that would leave root-owned directories on the
-# host (e.g. ~/src for a workdir ~/src/project) that the user can neither
-# write to nor remove, so create the mount point and its parents as the user.
-# A file is mounted on a file, so for a source that is one,
-# the mount point is created as an empty file.
-prepare_home_mount_point() {
-  declare destination="$1" source="${2:-}"
-  [[ "${destination}" == /home/?* ]] || return 0
-
-  declare directory="${state_dir}/home"
-  declare component
-  declare -a components
-  IFS=/ read -r -a components <<<"${destination#/home/}"
-  for component in "${components[@]}"; do
-    directory+="/${component}"
-    [[ -e "${directory}" ]] || break
-    if [[ ! -O "${directory}" ]]; then
-      warn "${directory} is not owned by ${username}" \
-        "(probably created by Docker in an earlier run);" \
-        "fix it with: sudo chown -R ${uid_host}:${gid_host} '${directory}'"
-      return 0
-    fi
-  done
-
-  if [[ -n "${source}" && ! -d "${source}" ]]; then
-    mkdir -p -- "${state_dir}${destination%/*}" || return
-    [[ -e "${state_dir}${destination}" ]] || : >"${state_dir}${destination}"
-    return
-  fi
-  mkdir -p -- "${state_dir}${destination}"
-}
-
-prepare_mount_points() {
-  prepare_home_mount_point "${workdir}" || return
-  prepare_home_mount_point "${home}/.claude" || return
-  declare path
-  for path in "${mount_paths[@]}"; do
-    prepare_home_mount_point "${path}" "${path}" || return
-  done
-  if [[ -d "${agents_dir}" ]]; then
-    prepare_home_mount_point "${home}/.agents" || return
-  fi
-  if [[ -d "${config_dir}" ]]; then
-    prepare_home_mount_point "${home}/.config/claude" || return
-  fi
-  if [[ -d "${git_config_dir}" ]]; then
-    prepare_home_mount_point "${home}/.config/git" || return
-  fi
 }
 
 # Write the container's passwd and group files under DIRECTORY/etc,
@@ -2302,7 +2399,7 @@ fill_tool_volume() {
 # and DIRECTORY/context/run.tar with them:
 # /etc/passwd and /etc/group, owned by root;
 # the home, owned by the user, 0700,
-# and the directories between it and each link under it,
+# and the directories between it and each link or mount point under it,
 # owned by the user, 0755, so that Docker does not make them as root;
 # and the links of run_links, with their targets from link_targets,
 # owned by root.
@@ -2314,7 +2411,7 @@ write_run_archive() {
   declare directory="$1"
   declare root="${directory}/root" archive="${directory}/context/run.tar"
   declare link path
-  declare -a links=() home_directories=()
+  declare -a links=() home_directories=() mount_points hidden_paths mounted_paths
   declare -A seen=()
   write_user_identity "${root}" || return
   mkdir -p -- "${root}${home}" "${archive%/*}" || return
@@ -2323,9 +2420,17 @@ write_run_archive() {
     mkdir -p -- "${root}${link%/*}" || return
     ln -s -- "${link_targets["${link}"]}" "${root}${link}" || return
     links+=("${link#/}")
-    path="${link%/*}"
+  done
+  set_reserved_paths
+  mount_points=("${workdir}" "${mount_paths[@]}" "${mounted_paths[@]}" "${home}/.cache")
+  for path in "${persisted_paths[@]}"; do
+    mount_points+=("${home}/${path}")
+  done
+  for path in "${run_links[@]}" "${mount_points[@]}"; do
+    path="${path%/*}"
     while [[ "${path}" == "${home}/"* && -z "${seen["${path}"]+defined}" ]]; do
       seen["${path}"]=1
+      mkdir -p -- "${root}${path}" || return
       chmod 755 -- "${root}${path}" || return
       home_directories+=("${path#/}")
       path="${path%/*}"
@@ -2408,13 +2513,20 @@ run_container() {
   docker_args+=(
     --env "CLAUDE_CONFIG_DIR=${home}/.claude"
     --env "HOME=${home}"
-    --mount "type=bind,src=${state_dir}/home,dst=/home"
-    --mount "type=bind,src=${claude_state},dst=${home}/.claude"
+    --tmpfs "${home}/.cache:rw,exec,nosuid,nodev,uid=${uid_host},gid=${gid_host},mode=0700"
     --mount "type=bind,src=${workdir},dst=${workdir}"
     --workdir "${workdir}"
   )
 
+  # Docker mounts each path after those above it,
+  # so the persisted paths in ~/.cache are mounted on top of its tmpfs.
   declare path
+  for path in "${persisted_paths[@]}"; do
+    docker_args+=(
+      --mount "type=bind,src=${persisted_bases["${path}"]}/${path},dst=${home}/${path}"
+    )
+  done
+
   declare -a writable_paths=("${workdir}")
   for path in "${mount_paths[@]}"; do
     if [[ "${mount_modes[${path}]}" == rw ]]; then
@@ -2807,7 +2919,8 @@ run() {
   declare home agents_dir config_dir git_config_dir
   declare managed_settings_file profile_image_id profile_generation
   declare project_config project_root profile container_image
-  declare -a project_mounts=() mount_paths=()
+  declare -a project_mounts=() mount_paths=() persisted_paths=()
+  declare -A persisted_kinds=() persisted_bases=() persisted_sources=()
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
   declare -A tool_volume_names=() tool_pins=()
@@ -2878,12 +2991,14 @@ run() {
   select_tools || return
   select_mounted_tools
   select_packages || return
+  select_persisted_paths || return
+  check_working_directory || return
   trace_working_directory || return
   select_mounts || return
   read_profile_launcher || return
   warn_missing_climbed_directories
   select_run_links
-  prepare_mount_points || return
+  prepare_persisted_paths || return
   link_agent_skills || return
   link_config_files || return
   ensure_image || return
