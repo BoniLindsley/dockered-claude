@@ -172,6 +172,11 @@ Tools:
   without the build cache, which updates tools that download their latest
   release.
 
+  A tool that writes its version to /opt/tools/NAME/version gets the
+  volume dockered-claude-tool-PROFILE-NAME-VERSION instead, labelled
+  dockered-claude.version too, and a version built already is kept rather
+  than built again.
+
   A run mounts the newest generation of each selected tool read-only at
   /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
   selection order, so the first tool selected wins on name collisions. It
@@ -1354,7 +1359,8 @@ build_tool_volume() {
   declare tool="$1" refresh="${2:-}"
   declare directory="${project_directory}/tools/${tool}"
   declare prefix="/opt/tools/${tool}"
-  declare temporary_directory tool_image generation volume
+  declare temporary_directory tool_image generation volume tool_version
+  declare existing
   declare -a tool_volumes tool_generations
 
   if [[ ! -f "${directory}/Dockerfile" ]]; then
@@ -1376,11 +1382,24 @@ build_tool_volume() {
 
   # The generation is chosen after the build,
   # so that a build finishing meanwhile is counted.
-  if find_tool_volumes "${tool}"; then
+  # A tool that gives its version is named by it,
+  # and a version built already is kept rather than built again.
+  if read_tool_version && find_tool_volumes "${tool}"; then
     generation=1
     ((${#tool_generations[@]} == 0)) ||
       generation=$((tool_generations[-1] + 1))
-    volume="dockered-claude-tool-${profile}-${tool}-${generation}"
+    volume="dockered-claude-tool-${profile}-${tool}-${tool_version:-${generation}}"
+    if [[ -n "${tool_version}" ]] &&
+      existing="$(docker volume ls --quiet \
+        --filter "label=dockered-claude.tool=${tool}" \
+        --filter "label=dockered-claude.profile=${profile}" \
+        --filter "label=dockered-claude.version=${tool_version}")" &&
+      [[ -n "${existing}" ]]; then
+      docker image rm "${tool_image}" >/dev/null || return
+      warn "tool '${tool}' ${tool_version} for profile '${profile}'" \
+        "is built already in ${existing//$'\n'/ }"
+      return 0
+    fi
     if fill_tool_volume; then
       docker image rm "${tool_image}" >/dev/null || return
       warn "built tool '${tool}' for profile '${profile}' in ${volume}"
@@ -1389,6 +1408,34 @@ build_tool_volume() {
   fi
   docker image rm "${tool_image}" >/dev/null
   return 1
+}
+
+# Set tool_version to the version in the file version
+# under prefix in tool_image,
+# or to nothing when the tool gives none.
+# Reads tool, prefix and tool_image from build_tool_volume.
+read_tool_version() {
+  declare container archive
+  tool_version=''
+  container="$(docker create "${tool_image}" /none)" || return
+  if ! archive="$(mktemp)"; then
+    docker rm "${container}" >/dev/null
+    return 1
+  fi
+  if docker cp "${container}:${prefix}/version" - >"${archive}" 2>/dev/null &&
+    ! tool_version="$(tar -xOf "${archive}")"; then
+    rm -f -- "${archive}"
+    docker rm "${container}" >/dev/null
+    return 1
+  fi
+  rm -f -- "${archive}" || return
+  docker rm "${container}" >/dev/null || return
+  # The version becomes part of a volume name.
+  if [[ -n "${tool_version}" &&
+    ! "${tool_version}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    warn "invalid version of tool '${tool}': '${tool_version}'"
+    return 1
+  fi
 }
 
 # Create volume with the files of tool_image at prefix, and its labels.
@@ -1400,14 +1447,15 @@ build_tool_volume() {
 # and the build label, which Docker sets only on a volume it creates,
 # shows whether this fill created the volume
 # or found one made by another build.
-# Reads tool, profile, generation, volume, prefix and tool_image
-# from build_tool_volume.
+# Reads tool, profile, generation, tool_version, volume, prefix
+# and tool_image from build_tool_volume.
 fill_tool_volume() {
   declare filler="${volume}-fill" build created_by label
   declare mount="type=volume,src=${volume},dst=${prefix}"
   build="$$-${RANDOM}-${RANDOM}"
   for label in "tool=${tool}" "profile=${profile}" \
-    "generation=${generation}" "build=${build}"; do
+    "generation=${generation}" "build=${build}" \
+    ${tool_version:+"version=${tool_version}"}; do
     mount+=",volume-label=dockered-claude.${label}"
   done
 

@@ -47,22 +47,38 @@ volume_label() {
 
 # A fake docker for the commands the tool functions use,
 # recording builds, creations and removals in calls.
+# The built tool image gives the version in image_version, if set.
 docker() {
-  declare argument name tool='' profile='' spec labels
+  declare argument name tool='' profile='' version='' quiet='' spec labels
   case "$1 $2" in
   'volume ls')
     for argument in "$@"; do
       case "${argument}" in
+      --quiet) quiet=1 ;;
       label=dockered-claude.tool=*) tool="${argument##*=}" ;;
       label=dockered-claude.profile=*) profile="${argument##*=}" ;;
+      label=dockered-claude.version=*) version="${argument##*=}" ;;
       esac
     done
     for name in "${volumes}"/*; do
-      [[ "${name}" != *.users ]] || continue
+      [[ -e "${name}" && "${name}" != *.users ]] || continue
       [[ "$(volume_label "${name##*/}" tool)" == "${tool}" ]] || continue
       [[ "$(volume_label "${name##*/}" profile)" == "${profile}" ]] || continue
-      printf '%s %s\n' "$(volume_label "${name##*/}" generation)" "${name##*/}"
+      [[ -z "${version}" ||
+        "$(volume_label "${name##*/}" version)" == "${version}" ]] || continue
+      if [[ -n "${quiet}" ]]; then
+        printf '%s\n' "${name##*/}"
+      else
+        printf '%s %s\n' "$(volume_label "${name##*/}" generation)" "${name##*/}"
+      fi
     done
+    ;;
+  'create sha256:tool') printf 'reader\n' ;;
+  'cp reader:'*)
+    [[ -n "${image_version:-}" ]] || return 1
+    mkdir -p -- "${temporary_directory}/image"
+    printf '%s\n' "${image_version}" >"${temporary_directory}/image/version"
+    tar -cf - -C "${temporary_directory}/image" version
     ;;
   'volume inspect')
     volume_label "${!#}" build
@@ -196,4 +212,38 @@ test_running_without_older_volumes_warns_nothing() {
   capture warn_unused_tool_volumes
   assert_status 0
   assert_equal '' "${errors}"
+}
+
+test_building_names_a_volume_by_the_version_the_tool_gives() {
+  reset_tools
+  add_volume dockered-claude-tool-default-uv-1 uv default 1
+  image_version=2.1.328
+  capture build_tool_volume uv refresh
+  assert_status 0
+  assert_contains "$(<"${calls}")" 'create dockered-claude-tool-default-uv-2.1.328'
+  assert_equal 2 "$(volume_label dockered-claude-tool-default-uv-2.1.328 generation)"
+  assert_equal 2.1.328 "$(volume_label dockered-claude-tool-default-uv-2.1.328 version)"
+}
+
+test_building_keeps_a_version_built_already() {
+  reset_tools
+  add_volume dockered-claude-tool-default-uv-2.1.328 uv default 1
+  printf '%s\n' version=2.1.328 >>"${volumes}/dockered-claude-tool-default-uv-2.1.328"
+  image_version=2.1.328
+  capture build_tool_volume uv refresh
+  assert_status 0
+  assert_contains "${errors}" \
+    "tool 'uv' 2.1.328 for profile 'default' is built already in dockered-claude-tool-default-uv-2.1.328"
+  [[ "$(<"${calls}")" != *'create dockered-claude'* ]] ||
+    fail 'expected no new volume'
+  assert_contains "$(<"${calls}")" 'image rm sha256:tool'
+}
+
+test_building_refuses_an_invalid_version() {
+  reset_tools
+  image_version='1.0 beta'
+  capture build_tool_volume uv
+  assert_status 1
+  assert_contains "${errors}" "invalid version of tool 'uv': '1.0 beta'"
+  assert_contains "$(<"${calls}")" 'image rm sha256:tool'
 }
