@@ -24,7 +24,6 @@ Commands:
                           so a prompt is given as: run 'PROMPT'
   build                   Rebuild the image of the project's profile, and
                           the packages image of the project's packages
-                          (also how Claude Code gets updated)
   profile list            List the profiles and whether each is built
   profile build NAME...   Build or update the image of each profile NAME
                           from profiles/NAME/Dockerfile
@@ -39,8 +38,9 @@ Options of run:
   -h, --help              Show this help (also after any command)
   --profile NAME          Use profile NAME (saved for the project)
   -t, --tool NAME         Make tool NAME available (repeatable; saved for the
-                          project)
-  --no-tools              Make no tools available (saved for the project)
+                          project); claude-code is always available
+  --no-tools              Make no tools available but claude-code (saved for
+                          the project)
   --package NAME          Add Debian package NAME to the image (repeatable;
                           saved for the project)
   --no-packages           Use the base image without extra packages (saved
@@ -183,6 +183,12 @@ Tools:
   warns about older generations that no container uses, which can be
   removed with docker volume rm. Volumes named dockered-claude-tool-NAME,
   from earlier versions of the launcher, are no longer used.
+
+  The tool claude-code, Claude Code itself, is always mounted, even with
+  --no-tools, and its bin/ goes last on PATH, after the image's. Claude
+  Code starts from it, with its auto-updater disabled, since its volume is
+  read-only. Update it with: ${script_name} tool build claude-code
+  (for each profile; with --profile NAME for others than the default).
 
   A tool may also have an env file in its directory, in docker's --env-file
   format, to set variables it needs (e.g. VCPKG_ROOT=/opt/tools/vcpkg/root).
@@ -489,6 +495,17 @@ select_tools() {
   done
 }
 
+# Set mounted_tools to the selected tools, without claude-code,
+# and then claude-code, which is always mounted.
+select_mounted_tools() {
+  declare tool
+  mounted_tools=()
+  for tool in "${tools[@]}"; do
+    [[ "${tool}" == claude-code ]] || mounted_tools+=("${tool}")
+  done
+  mounted_tools+=(claude-code)
+}
+
 # Tool names become path components on the host and in the container.
 validate_tool_name() {
   declare name="$1"
@@ -764,13 +781,13 @@ check_tool_defined() {
 }
 
 # Set tool_volume_names, by tool, to the newest volume
-# of each selected tool for the profile,
+# of each tool in mounted_tools for the profile,
 # building those that have none.
 # A volume left from a tool whose directory was removed is not used.
 find_tool_volume_names() {
   declare tool
   declare -a tool_volumes tool_generations
-  for tool in "${tools[@]}"; do
+  for tool in "${mounted_tools[@]}"; do
     [[ -z "${tool_volume_names[${tool}]+defined}" ]] || continue
     check_tool_defined "${tool}" || return
     find_tool_volumes "${tool}" || return
@@ -787,12 +804,12 @@ find_tool_volume_names() {
   done
 }
 
-# Warn about older volumes of the selected tools that no container uses.
+# Warn about older volumes of mounted_tools that no container uses.
 warn_unused_tool_volumes() {
   declare tool volume containers
   declare -a tool_volumes tool_generations unused=()
   declare -A seen=()
-  for tool in "${tools[@]}"; do
+  for tool in "${mounted_tools[@]}"; do
     [[ -z "${seen[${tool}]+defined}" ]] || continue
     seen[${tool}]=1
     find_tool_volumes "${tool}" || return
@@ -1262,7 +1279,9 @@ ensure_packages_image() {
     "${file%/*}" || return
 }
 
-# The docker run arguments of Claude Code's container.
+# The docker run arguments of Claude Code's container,
+# started from the claude-code tool, whatever the profile's entry point,
+# without its auto-updater, since the tool's volume is read-only.
 # SYS_PTRACE is only usable through the file capability on gdb in the image,
 # which no-new-privileges would ignore,
 # so that option is not set.
@@ -1271,6 +1290,8 @@ add_base_arguments() {
     run
     --cap-add SYS_PTRACE
     --cap-drop ALL
+    --entrypoint /opt/tools/claude-code/bin/claude
+    --env DISABLE_AUTOUPDATER=1
     --env "TERM=${TERM:-xterm-256color}"
     --init
     --interactive
@@ -1290,9 +1311,12 @@ add_base_arguments() {
   fi
 }
 
-# Mount each selected tool's volume in tool_volume_names
+# Mount the volume in tool_volume_names of each tool in mounted_tools
 # read-only at /opt/tools/<name>
-# and add its bin/ to path_entries, in selection order.
+# and add its bin/ to path_entries, in selection order,
+# except for claude-code, whose bin/ goes in path_suffix,
+# after the image's PATH,
+# so that it shadows nothing of the image or the other tools.
 # A tool's env file, if any, is passed with --env-file.
 # Later files override earlier ones,
 # so they are passed in reverse order to let the first tool win.
@@ -1301,11 +1325,15 @@ add_tool_arguments() {
   declare -a env_args=()
   declare -A seen=()
 
-  for tool in "${tools[@]}"; do
+  for tool in "${mounted_tools[@]}"; do
     [[ -z "${seen[${tool}]+defined}" ]] || continue
     seen[${tool}]=1
     check_tool_defined "${tool}" || return
-    path_entries+=("/opt/tools/${tool}/bin")
+    if [[ "${tool}" == claude-code ]]; then
+      path_suffix+=("/opt/tools/${tool}/bin")
+    else
+      path_entries+=("/opt/tools/${tool}/bin")
+    fi
     env_file="${project_directory}/tools/${tool}/env"
     if [[ -f "${env_file}" ]]; then
       if grep -Eq '^[[:space:]]*PATH([[:space:]]*=|[[:space:]]*$)' "${env_file}"; then
@@ -1332,10 +1360,11 @@ add_profile_arguments() {
   path_entries+=("${profile_path_entries[@]}")
 }
 
-# Put path_entries, in order, in front of the PATH of container_image.
+# Put path_entries, in order, in front of the PATH of container_image,
+# and path_suffix after it.
 add_path_argument() {
-  ((${#path_entries[@]} > 0)) || return 0
-  declare image_path entries
+  ((${#path_entries[@]} + ${#path_suffix[@]} > 0)) || return 0
+  declare image_path entries suffix
   image_path="$(docker image inspect \
     --format '{{range .Config.Env}}{{println .}}{{end}}' "${container_image}" |
     sed -n 's/^PATH=//p')" || return
@@ -1344,7 +1373,8 @@ add_path_argument() {
     return 1
   fi
   entries="$(IFS=: && printf '%s' "${path_entries[*]}")" || return
-  docker_args+=(--env "PATH=${entries}:${image_path}")
+  suffix="$(IFS=: && printf '%s' "${path_suffix[*]}")" || return
+  docker_args+=(--env "PATH=${entries:+${entries}:}${image_path}${suffix:+:${suffix}}")
 }
 
 # Build tools/TOOL/Dockerfile on the profile's image
@@ -1478,7 +1508,7 @@ fill_tool_volume() {
 }
 
 run_container() {
-  declare -a docker_args=() path_entries=()
+  declare -a docker_args=() path_entries=() path_suffix=()
   add_base_arguments || return
   add_tool_arguments || return
   add_profile_arguments || return
@@ -1571,6 +1601,7 @@ run() {
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
   declare -A tool_volume_names=()
+  declare -a mounted_tools=()
 
   declare name
 
@@ -1613,6 +1644,7 @@ run() {
   read_project_config || return
   select_profile || return
   select_tools || return
+  select_mounted_tools
   select_packages || return
   select_mounts || return
   read_profile_launcher || return

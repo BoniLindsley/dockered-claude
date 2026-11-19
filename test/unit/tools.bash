@@ -15,7 +15,7 @@ source -- "${launcher}" || return
 # and the fake docker's volumes, containers and calls in it.
 reset_tools() {
   set_launcher_paths
-  declare -ga tools=()
+  declare -ga mounted_tools=()
   declare -gA tool_volume_names=()
   project_directory="${temporary_directory}/launcher"
   volumes="${temporary_directory}/volumes"
@@ -181,7 +181,7 @@ test_running_mounts_the_newest_and_builds_missing_tools() {
   reset_tools
   add_volume dockered-claude-tool-default-uv-1 uv default 1
   add_volume dockered-claude-tool-default-uv-2 uv default 2
-  tools=(uv rclone uv)
+  mounted_tools=(uv rclone uv)
   capture find_tool_volume_names
   assert_status 0
   assert_equal dockered-claude-tool-default-uv-2 "${tool_volume_names[uv]}"
@@ -196,7 +196,7 @@ test_running_warns_only_about_older_volumes_no_container_uses() {
   add_volume dockered-claude-tool-default-uv-2 uv default 2 container
   add_volume dockered-claude-tool-default-uv-3 uv default 3
   add_volume dockered-claude-tool-default-rclone-1 rclone default 1
-  tools=(uv rclone)
+  mounted_tools=(uv rclone)
   capture warn_unused_tool_volumes
   assert_status 0
   assert_contains "${errors}" \
@@ -208,7 +208,7 @@ test_running_warns_only_about_older_volumes_no_container_uses() {
 test_running_without_older_volumes_warns_nothing() {
   reset_tools
   add_volume dockered-claude-tool-default-uv-1 uv default 1
-  tools=(uv rclone)
+  mounted_tools=(uv rclone)
   capture warn_unused_tool_volumes
   assert_status 0
   assert_equal '' "${errors}"

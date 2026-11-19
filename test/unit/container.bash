@@ -14,14 +14,16 @@ source -- "${launcher}" || return
 # and docker answering only for the image's PATH.
 reset_container() {
   set_launcher_paths
-  declare -ga tools=() docker_args=() path_entries=()
+  declare -ga mounted_tools=() docker_args=() path_entries=() path_suffix=()
   declare -gA tool_volume_names=(
     [uv]=dockered-claude-tool-default-uv-2
     [rclone]=dockered-claude-tool-default-rclone-1
+    ["claude-code"]=dockered-claude-tool-default-claude-code-2.1.328
   )
   project_directory="${temporary_directory}/launcher"
   container_image=dockered-claude-default:latest
-  mkdir -p -- "${project_directory}"/tools/{rclone,uv}
+  mkdir -p -- "${project_directory}"/tools/{rclone,uv,claude-code}
+  : >"${project_directory}/tools/claude-code/Dockerfile"
   : >"${project_directory}/tools/rclone/Dockerfile"
   : >"${project_directory}/tools/uv/Dockerfile"
   printf '%s\n' 'UV_CACHE_DIR=/tmp/uv' >"${project_directory}/tools/uv/env"
@@ -34,7 +36,7 @@ reset_container() {
 
 test_tools_go_in_front_of_the_image_path_in_order() {
   reset_container
-  tools=(uv rclone)
+  mounted_tools=(uv rclone)
   capture add_tool_arguments
   assert_status 0
   capture add_path_argument
@@ -55,7 +57,7 @@ test_without_path_entries_the_image_path_is_kept() {
 
 test_profile_variables_are_passed_and_its_path_follows_the_tools() {
   reset_container
-  tools=(uv)
+  mounted_tools=(uv)
   declare -ga profile_variables=(SDK_HOME) profile_path_entries=(/opt/sdk/bin)
   capture add_tool_arguments
   assert_status 0
@@ -68,4 +70,43 @@ test_profile_variables_are_passed_and_its_path_follows_the_tools() {
     --env-file "${project_directory}/tools/uv/env" \
     --env SDK_HOME \
     --env PATH=/opt/tools/uv/bin:/opt/sdk/bin:/usr/local/bin:/usr/bin
+}
+
+test_claude_code_goes_last_on_path_after_the_image() {
+  reset_container
+  mounted_tools=(uv claude-code)
+  declare -ga profile_variables=() profile_path_entries=(/opt/sdk/bin)
+  capture add_tool_arguments
+  assert_status 0
+  capture add_profile_arguments
+  assert_status 0
+  capture add_path_argument
+  assert_status 0
+  assert_contains "${docker_args[*]}" \
+    '--mount type=volume,src=dockered-claude-tool-default-claude-code-2.1.328,dst=/opt/tools/claude-code,readonly'
+  assert_equal \
+    PATH=/opt/tools/uv/bin:/opt/sdk/bin:/usr/local/bin:/usr/bin:/opt/tools/claude-code/bin \
+    "${docker_args[-1]}"
+}
+
+test_claude_code_alone_follows_the_image_path() {
+  reset_container
+  mounted_tools=(claude-code)
+  capture add_tool_arguments
+  assert_status 0
+  capture add_path_argument
+  assert_status 0
+  assert_equal PATH=/usr/local/bin:/usr/bin:/opt/tools/claude-code/bin \
+    "${docker_args[-1]}"
+}
+
+test_claude_code_is_always_mounted_and_last() {
+  set_launcher_paths
+  declare -ga mounted_tools=()
+  tools=(claude-code uv)
+  select_mounted_tools
+  assert_array mounted_tools uv claude-code
+  tools=()
+  select_mounted_tools
+  assert_array mounted_tools claude-code
 }

@@ -103,28 +103,17 @@ RUN : \
  && npm --version \
  && :
 
-# npm blocks install scripts of packages not covered by allowScripts,
-# and Claude Code needs its postinstall (node install.cjs)
-# to set up the claude command.
-# Only that package's scripts are allowed.
-RUN : \
- && npm install \
-    --allow-scripts=@anthropic-ai/claude-code \
-    --global \
-    --include=optional \
-    @anthropic-ai/claude-code@latest \
- && rm -rf /root/.npm \
- && test "$(command -v claude)" = "${NODE_ENV_DIR}/bin/claude" \
- && :
-
 ENV HOME=/home/claude
 
-# The root filesystem is read-only at runtime, so self-updates cannot work.
-# Update by rebuilding the image instead (launcher: --build).
+# Claude Code is the launcher's claude-code tool, mounted from a read-only
+# volume, so it cannot update itself.
+# Update it with: dockered-claude tool build claude-code
 ENV DISABLE_AUTOUPDATER=1
 
 # The image itself is non-root even when invoked without the wrapper.
 # The launcher overrides this with the invoking host user's UID/GID.
 USER 65532:65532
 
-ENTRYPOINT ["claude"]
+# The launcher starts Claude Code from its tool's volume.
+# Run without it, the image says so rather than failing obscurely.
+ENTRYPOINT ["/bin/sh", "-c", "claude=/opt/tools/claude-code/bin/claude; if [ -x \"$claude\" ]; then exec \"$claude\" \"$@\"; fi; echo 'Claude Code is not mounted at /opt/tools/claude-code; run this image with the dockered-claude launcher.' >&2; exit 1", "claude"]
