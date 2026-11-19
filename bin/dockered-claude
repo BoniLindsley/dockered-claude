@@ -2,16 +2,32 @@
 
 __help() {
   cat <<HELP
-Usage: ${script_name} [--help] [--build] [--tool NAME | --no-tools]...
+Usage: ${script_name} [run] [--tool NAME | --no-tools]...
                          [--package NAME | --no-packages]...
                          [--mount PATH[:rw] | --no-mounts]... [--no-save]
                          [--] [claude arguments...]
-       ${script_name} [--build] --build-tool NAME
+       ${script_name} build
+       ${script_name} tool list
+       ${script_name} tool build NAME...
+       ${script_name} --help
 
 Run Claude Code in an isolated Docker container.
 
-  -h, --help              Show this help
-  -b, --build             Rebuild the Docker image (also how Claude Code gets updated)
+Commands:
+  run                     Run Claude Code; the default when there are no
+                          arguments or the first is an option. The first
+                          argument that is not one of the options below,
+                          and every argument after it, go to Claude Code,
+                          so a prompt is given as: run 'PROMPT'
+  build                   Rebuild the Docker image, and the packages image
+                          of the project's packages (also how Claude Code
+                          gets updated)
+  tool list               List the tools and whether each is built
+  tool build NAME...      Build or update each tool NAME from
+                          tools/NAME/Dockerfile, replacing its volume
+
+Options of run:
+  -h, --help              Show this help (also after any command)
   -t, --tool NAME         Make tool NAME available (repeatable; saved for the
                           project)
   --no-tools              Make no tools available (saved for the project)
@@ -23,9 +39,6 @@ Run Claude Code in an isolated Docker container.
                           with :rw (repeatable; saved for the project)
   --no-mounts             Mount no paths (saved for the project)
   --no-save               Use these options for this run only
-  --build-tool NAME       Build or update tool NAME from tools/NAME/Dockerfile,
-                          replacing its volume
-  --list-tools            List the tools and whether each is built
   --                      Pass remaining arguments directly to Claude Code
 
 Environment:
@@ -62,7 +75,7 @@ Project configuration:
   yet, it is created in the main worktree, or else in the working
   directory. .meta/ is excluded from git through info/exclude unless it is
   ignored already. The directory is mounted read-only in the container,
-  since the launcher reads it on the host. Tool builds (--build-tool)
+  since the launcher reads it on the host. Tool builds (tool build)
   neither read nor save it.
 
   tools = NAME...         Tools to use when no --tool is given
@@ -92,7 +105,7 @@ Mounts:
   Packages are installed in an image derived from the base image, tagged
   by a hash of the sorted package names (as in
   dockered-claude:packages-3f9a1c2b4d5e), so projects with the same
-  packages share it. It is rebuilt with --build and whenever the base
+  packages share it. It is rebuilt with build and whenever the base
   image has changed. Remove unused ones with:
   docker image prune --all --filter label=dockered-claude.packages
   (they are rebuilt when next needed). Tools are built on the base image,
@@ -108,7 +121,7 @@ Tools:
   holds only that directory (FROM scratch, then COPY --from). The launcher
   copies it into the volume dockered-claude-tool-NAME and removes the
   image, so the volume is the only copy. A selected tool whose volume is
-  missing is built before Claude Code starts. --build-tool rebuilds it
+  missing is built before Claude Code starts. tool build rebuilds it
   without the build cache, which updates tools that download their latest
   release; Docker refuses to replace a volume in use, so stop containers
   using the tool first. Remove a tool's volume with:
@@ -125,14 +138,15 @@ Tools:
 
 Examples:
   ${script_name}
-  ${script_name} --build
-  ${script_name} -- --help
+  ${script_name} build
+  ${script_name} run -- --help
   ${script_name} -p 'run the tests'
+  ${script_name} run 'fix the failing test'
   ${script_name} --tool rclone --tool typescript
   ${script_name} --mount ~/src/library --mount ~/notes:rw
   ${script_name} --no-save --mount ~/Downloads
   ${script_name} --no-mounts
-  ${script_name} --build-tool vcpkg
+  ${script_name} tool build vcpkg
 HELP
 }
 
@@ -140,26 +154,59 @@ warn() {
   printf '%s: %s\n' "${script_name}" "$*" >&2
 }
 
+# Set kwargs[command] from the first argument,
+# and parse the rest as that command takes them.
+# With no arguments, or an option first, the command is run.
 parse_arguments() {
+  if (($# == 0)); then
+    kwargs[command]=run
+    return 0
+  fi
+  case "$1" in
+  run)
+    kwargs[command]=run
+    shift
+    parse_run_arguments "$@" || return
+    ;;
+  build)
+    kwargs[command]=build
+    shift
+    parse_no_arguments build "$@" || return
+    ;;
+  tool)
+    shift
+    parse_tool_arguments "$@" || return
+    ;;
+  -*)
+    kwargs[command]=run
+    parse_run_arguments "$@" || return
+    ;;
+  *)
+    warn "unknown command '$1';" \
+      "to give Claude Code a prompt, use: ${script_name} run PROMPT"
+    return 1
+    ;;
+  esac
+}
+
+# Parse the options of run into kwargs, tools, packages and mounts,
+# and the arguments for Claude Code into args:
+# the first argument that is not an option of run, and all after it.
+parse_run_arguments() {
   declare argument
   while (($#)); do
     argument="$1"
     shift
     case "${argument}" in
     -h | --help) kwargs[help]=1 ;;
-    -b | --build) kwargs[build]=1 ;;
-    -t | --tool | --build-tool)
+    -t | --tool)
       if (($# == 0)); then
         warn "${argument} requires a tool name"
         return 1
       fi
       validate_tool_name "$1" || return
-      if [[ "${argument}" == --build-tool ]]; then
-        kwargs[build_tool]="$1"
-      else
-        tools+=("$1")
-        kwargs[tools_given]=1
-      fi
+      tools+=("$1")
+      kwargs[tools_given]=1
       shift
       ;;
     --no-tools)
@@ -195,7 +242,20 @@ parse_arguments() {
       kwargs[mounts_given]=1
       ;;
     --no-save) kwargs[no_save]=1 ;;
-    --list-tools) kwargs[list_tools]=1 ;;
+    # Options of earlier versions, which Claude Code would otherwise get.
+    -b | --build)
+      warn "${argument} was replaced by the command: ${script_name} build"
+      return 1
+      ;;
+    --build-tool)
+      warn "${argument} was replaced by the command:" \
+        "${script_name} tool build NAME"
+      return 1
+      ;;
+    --list-tools)
+      warn "${argument} was replaced by the command: ${script_name} tool list"
+      return 1
+      ;;
     --)
       args+=("$@")
       break
@@ -206,6 +266,60 @@ parse_arguments() {
       ;;
     esac
   done
+}
+
+# Parse the arguments of command, which takes only --help.
+parse_no_arguments() {
+  declare command="$1" argument
+  shift
+  for argument in "$@"; do
+    case "${argument}" in
+    -h | --help) kwargs[help]=1 ;;
+    *)
+      warn "${command}: unexpected argument '${argument}'"
+      return 1
+      ;;
+    esac
+  done
+}
+
+# Set kwargs[command] to tool-list or tool-build,
+# and args to the names of the tools to build.
+parse_tool_arguments() {
+  declare argument
+  case "${1:-}" in
+  -h | --help) kwargs[help]=1 ;;
+  list)
+    kwargs[command]='tool-list'
+    shift
+    parse_no_arguments 'tool list' "$@" || return
+    ;;
+  build)
+    kwargs[command]='tool-build'
+    shift
+    for argument in "$@"; do
+      case "${argument}" in
+      -h | --help) kwargs[help]=1 ;;
+      *)
+        validate_tool_name "${argument}" || return
+        args+=("${argument}")
+        ;;
+      esac
+    done
+    if ((${#args[@]} == 0)) && [[ -z "${kwargs[help]+defined}" ]]; then
+      warn "tool build requires a tool name"
+      return 1
+    fi
+    ;;
+  '')
+    warn "tool requires list or build"
+    return 1
+    ;;
+  *)
+    warn "unknown tool command '$1'"
+    return 1
+    ;;
+  esac
 }
 
 resolve_paths() {
@@ -819,16 +933,14 @@ build_image() {
 }
 
 ensure_image() {
-  if [[ -n "${kwargs[build]+defined}" ]] || ! image_exists; then
-    build_image || return
-  fi
+  image_exists || build_image || return
 }
 
 # Run containers from an image with the selected packages
 # on top of the base image,
 # tagged by a hash of their sorted names
 # so that projects with the same packages share it.
-# Build it with --build, when it is missing,
+# Build it with the build command, when it is missing,
 # or when it was built from another base image.
 ensure_packages_image() {
   ((${#packages[@]} > 0)) || return 0
@@ -840,7 +952,7 @@ ensure_packages_image() {
   container_image="${repository}:packages-${hash:0:12}"
 
   base_id="$(docker image inspect --format '{{.Id}}' "${image}")" || return
-  if [[ -z "${kwargs[build]+defined}" ]] &&
+  if [[ "${kwargs[command]}" != build ]] &&
     built_from="$(docker image inspect \
       --format '{{index .Config.Labels "dockered-claude.base-image"}}' \
       "${container_image}" 2>/dev/null)" &&
@@ -1079,9 +1191,19 @@ run_container() {
   exec docker "${docker_args[@]}" "${container_image}" "$@"
 }
 
-# Run Claude Code with args,
-# or build the tool in kwargs[build_tool],
-# as the other options in kwargs, tools, packages and mounts say.
+# Rebuild the base image,
+# and the packages image of the project's saved packages.
+build_images() {
+  build_image || return
+  find_project_config || return
+  read_project_config || return
+  select_packages || return
+  ensure_packages_image || return
+}
+
+# Do the command in kwargs[command]:
+# run Claude Code with args, as the options in kwargs, tools, packages
+# and mounts say; rebuild the images; list tools; or build the tools in args.
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
   declare home passwd_file group_file agents_dir config_dir git_config_dir
@@ -1089,17 +1211,26 @@ run() {
   declare -a project_mounts=() mount_paths=()
   declare -A project_options=() mount_modes=()
 
+  declare tool
+
   resolve_paths || return
-  if [[ -n "${kwargs[list_tools]+defined}" ]]; then
+  case "${kwargs[command]}" in
+  build)
+    build_images
+    return
+    ;;
+  tool-list)
     list_tools
     return
-  fi
-
-  if [[ -n "${kwargs[build_tool]+defined}" ]]; then
+    ;;
+  tool-build)
     ensure_image || return
-    build_tool_volume "${kwargs[build_tool]}" refresh || return
+    for tool in "${args[@]}"; do
+      build_tool_volume "${tool}" refresh || return
+    done
     return
-  fi
+    ;;
+  esac
 
   prepare_state_directory || return
   find_project_config || return
