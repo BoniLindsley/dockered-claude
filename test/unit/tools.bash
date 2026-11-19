@@ -17,7 +17,7 @@ source -- "${launcher}" || return
 reset_tools() {
   set_launcher_paths
   declare -ga mounted_tools=()
-  declare -gA tool_volume_names=()
+  declare -gA tool_volume_names=() tool_pins=()
   project_directory="${temporary_directory}/launcher"
   volumes="${temporary_directory}/volumes"
   containers="${temporary_directory}/containers"
@@ -57,7 +57,7 @@ volume_label() {
 # and a tool's latest-version prints latest_output, failing when unset.
 docker() {
   declare argument name tool='' profile='' version='' base='' quiet=''
-  declare spec labels
+  declare generation='' format='' spec labels
   case "$1 $2" in
   'volume ls')
     for argument in "$@"; do
@@ -67,6 +67,8 @@ docker() {
       label=dockered-claude.profile=*) profile="${argument##*=}" ;;
       label=dockered-claude.version=*) version="${argument##*=}" ;;
       label=dockered-claude.base-image=*) base="${argument##*=}" ;;
+      label=dockered-claude.generation=*) generation="${argument##*=}" ;;
+      '{{'*) format="${argument}" ;;
       esac
     done
     for name in "${volumes}"/*; do
@@ -77,7 +79,12 @@ docker() {
         "$(volume_label "${name##*/}" version)" == "${version}" ]] || continue
       [[ -z "${base}" ||
         "$(volume_label "${name##*/}" base-image)" == "${base}" ]] || continue
-      if [[ -n "${quiet}" ]]; then
+      [[ -z "${generation}" ||
+        "$(volume_label "${name##*/}" generation)" == "${generation}" ]] ||
+        continue
+      if [[ "${format}" == *profile-generation* && "${format}" != */* ]]; then
+        volume_label "${name##*/}" profile-generation
+      elif [[ -n "${quiet}" ]]; then
         printf '%s\n' "${name##*/}"
       else
         printf '%s/%s/%s\n' "$(volume_label "${name##*/}" generation)" \
@@ -219,6 +226,8 @@ test_running_warns_only_about_older_volumes_no_container_uses() {
   add_volume dockered-claude-tool-default-uv-3 uv default 3
   add_volume dockered-claude-tool-default-rclone-1 rclone default 1
   mounted_tools=(uv rclone)
+  tool_volume_names=([uv]=dockered-claude-tool-default-uv-3
+    [rclone]=dockered-claude-tool-default-rclone-1)
   capture warn_unused_tool_volumes
   assert_status 0
   assert_contains "${errors}" \
@@ -231,6 +240,7 @@ test_running_without_older_volumes_warns_nothing() {
   reset_tools
   add_volume dockered-claude-tool-default-uv-1 uv default 1
   mounted_tools=(uv rclone)
+  tool_volume_names=([uv]=dockered-claude-tool-default-uv-1)
   capture warn_unused_tool_volumes
   assert_status 0
   assert_equal '' "${errors}"
@@ -349,4 +359,53 @@ test_running_builds_a_tool_built_only_from_another_image() {
   capture find_tool_volume_names
   assert_status 0
   assert_equal dockered-claude-tool-default-1-uv-2 "${tool_volume_names[uv]}"
+}
+
+test_running_mounts_a_pinned_generation() {
+  reset_tools
+  add_volume dockered-claude-tool-default-1-uv-1 uv default 1
+  add_volume dockered-claude-tool-default-1-uv-2 uv default 2
+  mounted_tools=(uv)
+  tool_pins=([uv]=1)
+  capture find_tool_volume_names
+  assert_status 0
+  assert_equal dockered-claude-tool-default-1-uv-1 "${tool_volume_names[uv]}"
+}
+
+test_running_refuses_a_pin_built_from_another_profile_image() {
+  reset_tools
+  volume_base=sha256:old add_volume dockered-claude-tool-default-1-uv-1 \
+    uv default 1
+  add_volume dockered-claude-tool-default-2-uv-2 uv default 2
+  profile_generation=2
+  mounted_tools=(uv)
+  tool_pins=([uv]=1)
+  capture find_tool_volume_names
+  assert_status 1
+  assert_contains "${errors}" \
+    "was built from generation 1 of profile 'default', not from the one latest marks (2)"
+  assert_contains "${errors}" 'profile use default 1'
+}
+
+test_running_refuses_a_pin_that_is_gone() {
+  reset_tools
+  add_volume dockered-claude-tool-default-1-uv-2 uv default 2
+  mounted_tools=(uv)
+  tool_pins=([uv]=1)
+  capture find_tool_volume_names
+  assert_status 1
+  assert_contains "${errors}" 'no longer exists'
+  assert_file "${calls}" ''
+}
+
+test_running_warns_about_the_newest_when_an_older_one_is_pinned() {
+  reset_tools
+  add_volume dockered-claude-tool-default-1-uv-1 uv default 1
+  add_volume dockered-claude-tool-default-1-uv-2 uv default 2
+  mounted_tools=(uv)
+  tool_volume_names=([uv]=dockered-claude-tool-default-1-uv-1)
+  capture warn_unused_tool_volumes
+  assert_status 0
+  assert_contains "${errors}" 'docker volume rm dockered-claude-tool-default-1-uv-2'
+  [[ "${errors}" != *uv-1* ]] || fail "expected only uv-2: ${errors}"
 }

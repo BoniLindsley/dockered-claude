@@ -3,7 +3,7 @@
 __help() {
   cat <<HELP
 Usage: ${script_name} [run] [--profile NAME]
-                         [--tool NAME | --no-tools]...
+                         [--tool NAME[:GENERATION] | --no-tools]...
                          [--package NAME | --no-packages]...
                          [--mount PATH[:rw] | --no-mounts]... [--no-save]
                          [--] [claude arguments...]
@@ -35,9 +35,10 @@ Commands:
                           Mark generation GENERATION of profile NAME latest
   profile revert NAME     Mark latest the generation of profile NAME before
                           the one latest marks
-  tool list               List the tools and whether each is built for
-                          the profile of --profile, else that of
-                          DOCKERED_CLAUDE_PROFILE
+  tool list               List the tools and their generations for the
+                          profile of --profile, else that of
+                          DOCKERED_CLAUDE_PROFILE, marking those used
+                          unless pinned
   tool build NAME...      Build or update each tool NAME from
                           tools/NAME/Dockerfile for that profile, as a new
                           generation of its volume
@@ -71,8 +72,11 @@ Options of clean:
 Options of run:
   -h, --help              Show this help (also after any command)
   --profile NAME          Use profile NAME (saved for the project)
-  -t, --tool NAME         Make tool NAME available (repeatable; saved for the
-                          project); claude-code is always available
+  -t, --tool NAME[:GENERATION]
+                          Make tool NAME available (repeatable; saved for the
+                          project); claude-code is always available. With
+                          GENERATION, use that generation of its volume
+                          rather than the newest
   --no-tools              Make no tools available but claude-code (saved for
                           the project)
   --package NAME          Add Debian package NAME to the image (repeatable;
@@ -133,7 +137,9 @@ Project configuration:
   neither read nor save it.
 
   profile = NAME          Profile to use when no --profile is given
-  tools = NAME...         Tools to use when no --tool is given
+  tools = NAME[:GENERATION]...
+                          Tools to use when no --tool is given, each pinned
+                          to GENERATION when given
   packages = NAME...      Debian packages to add when no --package is given
   mount = PATH[:rw]       A path to mount when no --mount is given,
                           read-only, or writable with :rw (one line per
@@ -241,9 +247,13 @@ Tools:
 
   A run mounts the newest generation of each selected tool read-only at
   /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
-  selection order, so the first tool selected wins on name collisions. It
-  warns about older generations that no container uses, which can be
-  removed with: ${script_name} clean tools. Volumes named
+  selection order, so the first tool selected wins on name collisions. A
+  project may pin a generation instead, with --tool NAME:GENERATION;
+  generations count across the profile's images, so a pin always names
+  the same volume, and a run refuses one built from another image than
+  the one latest marks, or one removed, such as by clean, which does not
+  know about pins. A run warns about the other generations that no
+  container uses, which can be removed with: ${script_name} clean tools. Volumes named
   dockered-claude-tool-NAME, from earlier versions of the launcher, are no
   longer used.
 
@@ -346,7 +356,7 @@ parse_run_arguments() {
         warn "${argument} requires a tool name"
         return 1
       fi
-      validate_tool_name "$1" || return
+      validate_tool_spec "$1" || return
       tools+=("$1")
       kwargs[tools_given]=1
       shift
@@ -649,22 +659,33 @@ select_tools() {
   fi
   declare tool
   for tool in "${tools[@]}"; do
-    validate_tool_name "${tool}" || return
+    validate_tool_spec "${tool}" || return
   done
 }
 
-# Set mounted_tools to the selected tools, without claude-code,
-# and then claude-code, which is always mounted.
+# Set mounted_tools to the names of the selected tools, without claude-code,
+# and then claude-code, which is always mounted,
+# and tool_pins, by name, to the generations pinned.
 select_mounted_tools() {
-  declare tool
+  declare spec tool
   mounted_tools=()
-  for tool in "${tools[@]}"; do
+  for spec in "${tools[@]}"; do
+    tool="${spec%%:*}"
+    [[ "${spec}" != *:* ]] || tool_pins[${tool}]="${spec#*:}"
     [[ "${tool}" == claude-code ]] || mounted_tools+=("${tool}")
   done
   mounted_tools+=(claude-code)
 }
 
 # Tool names become path components on the host and in the container.
+# A tool is given as NAME, or as NAME:GENERATION
+# to pin that generation of its volume.
+validate_tool_spec() {
+  declare spec="$1"
+  validate_tool_name "${spec%%:*}" || return
+  [[ "${spec}" != *:* ]] || validate_generation "${spec#*:}"
+}
+
 validate_tool_name() {
   declare name="$1"
   if [[ ! "${name}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
@@ -945,16 +966,6 @@ read_profile_image() {
   profile_generation="${generation}"
 }
 
-# A tool is built for the profile
-# once it has a volume built from profile_image_id.
-tool_built() {
-  declare tool="$1"
-  declare -a tool_volumes tool_generations
-  declare tool_newest_generation
-  find_tool_volumes "${tool}" || return
-  ((${#tool_volumes[@]} > 0))
-}
-
 check_tool_defined() {
   declare tool="$1"
   tool_defined "${tool}" && return 0
@@ -963,8 +974,10 @@ check_tool_defined() {
   return 1
 }
 
-# Set tool_volume_names, by tool, to the newest volume
-# of each tool in mounted_tools built from profile_image_id,
+# Set tool_volume_names, by tool,
+# to the volume of each tool in mounted_tools
+# of the generation pinned in tool_pins,
+# else to the newest built from profile_image_id,
 # building those that have none,
 # as after a new build of the profile.
 # A volume left from a tool whose directory was removed is not used.
@@ -975,6 +988,10 @@ find_tool_volume_names() {
     [[ -z "${tool_volume_names[${tool}]+defined}" ]] || continue
     check_tool_defined "${tool}" || return
     find_tool_volumes "${tool}" || return
+    if [[ -n "${tool_pins[${tool}]+defined}" ]]; then
+      find_pinned_tool_volume "${tool}" "${tool_pins[${tool}]}" || return
+      continue
+    fi
     if ((${#tool_volumes[@]} == 0)); then
       warn "building tool '${tool}' for profile '${profile}'"
       build_tool_volume "${tool}" || return
@@ -988,8 +1005,39 @@ find_tool_volume_names() {
   done
 }
 
-# Warn about older volumes of mounted_tools
-# built from profile_image_id that no container uses.
+# Set the volume of TOOL in tool_volume_names
+# to that of generation GENERATION in tool_volumes,
+# or fail, saying whether that generation was built from another image
+# of the profile or is gone.
+# Reads tool_volumes and tool_generations as find_tool_volumes sets them.
+find_pinned_tool_volume() {
+  declare tool="$1" pinned="$2" index built_on
+  for index in "${!tool_generations[@]}"; do
+    [[ "${tool_generations[index]}" == "${pinned}" ]] || continue
+    tool_volume_names[${tool}]="${tool_volumes[index]}"
+    return 0
+  done
+  built_on="$(docker volume ls \
+    --filter "label=dockered-claude.tool=${tool}" \
+    --filter "label=dockered-claude.profile=${profile}" \
+    --filter "label=dockered-claude.generation=${pinned}" \
+    --format '{{.Label "dockered-claude.profile-generation"}}')" || return
+  if [[ -n "${built_on}" ]]; then
+    warn "the pinned generation ${pinned} of tool '${tool}'" \
+      "was built from generation ${built_on%%$'\n'*} of profile '${profile}'," \
+      "not from the one latest marks (${profile_generation:-none});" \
+      "pin another generation, or mark that one latest with:" \
+      "${script_name} profile use ${profile} ${built_on%%$'\n'*}"
+  else
+    warn "the pinned generation ${pinned} of tool '${tool}'" \
+      "for profile '${profile}' no longer exists;" \
+      "pin another, as listed by: ${script_name} tool list"
+  fi
+  return 1
+}
+
+# Warn about the volumes of mounted_tools built from profile_image_id
+# other than those in tool_volume_names that no container uses.
 warn_unused_tool_volumes() {
   declare tool volume containers tool_newest_generation
   declare -a tool_volumes tool_generations unused=()
@@ -998,15 +1046,15 @@ warn_unused_tool_volumes() {
     [[ -z "${seen[${tool}]+defined}" ]] || continue
     seen[${tool}]=1
     find_tool_volumes "${tool}" || return
-    ((${#tool_volumes[@]} > 1)) || continue
-    for volume in "${tool_volumes[@]:0:${#tool_volumes[@]}-1}"; do
+    for volume in "${tool_volumes[@]}"; do
+      [[ "${volume}" != "${tool_volume_names[${tool}]:-}" ]] || continue
       containers="$(docker ps --all --quiet --filter "volume=${volume}")" ||
         return
       [[ -n "${containers}" ]] || unused+=("${volume}")
     done
   done
   ((${#unused[@]} > 0)) || return 0
-  warn "older tool volumes that no container uses:" "${unused[*]};" \
+  warn "tool volumes not in use that no container uses:" "${unused[*]};" \
     "remove them with: docker volume rm ${unused[*]}"
 }
 
@@ -1092,7 +1140,7 @@ save_project_options() {
   if [[ -n "${kwargs[tools_given]+defined}" ]]; then
     declare tool
     for tool in "${tools[@]}"; do
-      check_tool_defined "${tool}" || return
+      check_tool_defined "${tool%%:*}" || return
     done
     save_project_option tools "${tools[*]}" || return
   fi
@@ -1227,17 +1275,44 @@ exclude_meta_directory() {
   warn "excluded /${prefix}.meta/ from git in ${exclude}"
 }
 
+# Print each tool, with its generations for the profile, newest first,
+# each with the generation of the profile image it was built from,
+# marking the one a run uses unless a project pins another,
+# or with "(not built)".
 list_tools() {
-  declare entry tool
+  declare entry tool listing generation base built_on name default
   for entry in "${project_directory}"/tools/*/Dockerfile; do
     [[ -f "${entry}" ]] || continue
     entry="${entry%/Dockerfile}"
     tool="${entry##*/}"
-    if tool_built "${tool}"; then
-      printf '%s\n' "${tool}"
-    else
+    listing="$(docker volume ls \
+      --filter "label=dockered-claude.tool=${tool}" \
+      --filter "label=dockered-claude.profile=${profile}" \
+      --format '{{.Label "dockered-claude.generation"}}/{{.Label "dockered-claude.base-image"}}/{{.Label "dockered-claude.profile-generation"}}/{{.Name}}')" ||
+      return
+    listing="$(sort -rn <<<"${listing}")" || return
+    if [[ -z "${listing}" ]]; then
       printf '%s (not built)\n' "${tool}"
+      continue
     fi
+    printf '%s\n' "${tool}"
+    default=''
+    while IFS=/ read -r generation base built_on name; do
+      [[ "${generation}" =~ ^[1-9][0-9]*$ ]] || continue
+      if [[ -z "${base}" ]]; then
+        printf '  %s, built before tool volumes were tied to profile images' \
+          "${generation}"
+      else
+        printf '  %s, built from generation %s of the profile' \
+          "${generation}" "${built_on}"
+      fi
+      if [[ -z "${default}" && -n "${base}" &&
+        "${base}" == "${profile_image_id}" ]]; then
+        default=1
+        printf ' (used unless pinned)'
+      fi
+      printf '\n'
+    done <<<"${listing}"
   done
 }
 
@@ -2315,7 +2390,7 @@ run() {
   declare -a project_mounts=() mount_paths=()
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
-  declare -A tool_volume_names=()
+  declare -A tool_volume_names=() tool_pins=()
   declare -a mounted_tools=()
 
   declare name

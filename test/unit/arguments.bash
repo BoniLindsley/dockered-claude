@@ -304,6 +304,20 @@ test_tools_have_no_use_or_revert_yet() {
   assert_contains "${errors}" "unknown tool command 'revert'"
 }
 
+test_tools_may_pin_a_generation() {
+  reset_arguments
+  capture parse_arguments --tool uv:3 --tool rclone
+  assert_status 0
+  assert_array tools uv:3 rclone
+
+  for spec in uv: uv:0 uv:x; do
+    reset_arguments
+    capture parse_arguments --tool "${spec}"
+    assert_status 1
+    assert_contains "${errors}" 'invalid generation'
+  done
+}
+
 test_tool_commands_take_a_profile() {
   reset_arguments
   capture parse_arguments tool list --profile minimal

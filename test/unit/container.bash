@@ -193,3 +193,14 @@ test_managed_settings_outside_writable_paths_are_not_mounted_again() {
     "${output}" != *"dst=${managed_settings_file}"* ]] ||
     fail "expected no mount at the files' own paths: ${output}"
 }
+
+test_pinned_tools_are_mounted_by_name() {
+  declare -ga tools=(uv:3 claude-code:7 rclone)
+  declare -ga mounted_tools=()
+  declare -gA tool_pins=()
+  select_mounted_tools
+  assert_array mounted_tools uv rclone claude-code
+  assert_equal 3 "${tool_pins[uv]}"
+  assert_equal 7 "${tool_pins[claude-code]}"
+  assert_equal '' "${tool_pins[rclone]:-}"
+}

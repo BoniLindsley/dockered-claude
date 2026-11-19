@@ -194,25 +194,34 @@ test_ensuring_an_image_builds_a_missing_one() {
 
 test_tool_list_shows_which_tools_are_built() {
   reset_commands
-  mkdir -p -- "${project_directory}"/tools/{built,missing,empty}
+  mkdir -p -- "${project_directory}"/tools/{built,missing,old,empty}
   : >"${project_directory}/tools/built/Dockerfile"
   : >"${project_directory}/tools/missing/Dockerfile"
+  : >"${project_directory}/tools/old/Dockerfile"
   # shellcheck disable=SC2329 # Called by list_tools.
   docker() {
     case "$*" in
     'image ls '*) printf '%s\n' 'latest sha256:base now' '1 sha256:base now' ;;
     *'label=dockered-claude.tool=built '*'label=dockered-claude.profile=default '*)
-      printf '%s\n' '1/sha256:base/dockered-claude-tool-default-1-built-1'
+      printf '%s\n' '1/sha256:old/1/dockered-claude-tool-default-1-built-1' \
+        '3/sha256:base/2/dockered-claude-tool-default-2-built-3' \
+        '2/sha256:base/2/dockered-claude-tool-default-2-built-2'
       ;;
-    *'label=dockered-claude.tool=missing '*)
-      printf '%s\n' '1/sha256:old/dockered-claude-tool-default-1-missing-1'
+    *'label=dockered-claude.tool=old '*)
+      printf '%s\n' '1///dockered-claude-tool-default-old-1'
       ;;
     esac
   }
   parse_arguments tool list
   capture run
   assert_status 0
-  assert_equal $'built\nmissing (not built)' "${output}"
+  assert_equal 'built
+  3, built from generation 2 of the profile (used unless pinned)
+  2, built from generation 2 of the profile
+  1, built from generation 1 of the profile
+missing (not built)
+old
+  1, built before tool volumes were tied to profile images' "${output}"
 }
 
 test_tool_build_builds_each_tool_without_the_cache() {
