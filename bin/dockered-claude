@@ -1073,7 +1073,7 @@ read_profile_function() {
 # Read what the functions of the profile's launcher.bash print:
 # set profile_variables to the host variables named that are set,
 # add the existing paths to mount that are not mounted already,
-# marking them in profile_mount_paths so that they are never saved,
+# marking them in unsaved_mount_paths so that they are never saved,
 # and set profile_path_entries to the directories for PATH.
 read_profile_launcher() {
   declare script="${project_directory}/profiles/${profile}/launcher.bash"
@@ -1106,7 +1106,7 @@ read_profile_launcher() {
       warn "${script}: profile_mounts: cannot mount '${mount_path}'"
       return 1
     fi
-    profile_mount_paths[${mount_path}]=1
+    unsaved_mount_paths[${mount_path}]=1
   done
 
   read_profile_function profile_path || return
@@ -1561,7 +1561,7 @@ save_project_option() {
 }
 
 # Save the mounts in mount_paths, given with --mount or --no-mounts,
-# except those of the profile, in profile_mount_paths,
+# except those in unsaved_mount_paths, such as the profile's,
 # as "mount = PATH[:rw]" lines with their paths as given,
 # made absolute, from mount_given_paths,
 # if they differ from the saved ones,
@@ -1573,7 +1573,7 @@ save_project_mounts() {
   declare -a config_lines settings=() old_settings=() new_lines=()
 
   for mount_path in "${mount_paths[@]}"; do
-    [[ -z "${profile_mount_paths[${mount_path}]+defined}" ]] || continue
+    [[ -z "${unsaved_mount_paths[${mount_path}]+defined}" ]] || continue
     line="mount = ${mount_given_paths[${mount_path}]:-${mount_path}}"
     [[ "${mount_modes[${mount_path}]}" == ro ]] || line+=":rw"
     settings+=("${line}")
@@ -2925,7 +2925,7 @@ run() {
   declare -a project_mounts=() mount_paths=() persisted_paths=()
   declare -A persisted_kinds=() persisted_bases=() persisted_sources=()
   declare -a profile_variables=() profile_path_entries=()
-  declare -A project_options=() mount_modes=() profile_mount_paths=()
+  declare -A project_options=() mount_modes=() unsaved_mount_paths=()
   declare -A tool_volume_names=() tool_pins=()
   declare -a mounted_tools=() link_paths=() run_links=()
   declare -A link_targets=() link_climbs=() mount_given_paths=()

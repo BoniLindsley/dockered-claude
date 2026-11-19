@@ -12,7 +12,7 @@ source -- "${launcher}" || return
 # with project_root a new directory and project_config in it.
 reset_configuration() {
   set_launcher_paths
-  declare -gA kwargs=() project_options=() mount_modes=() profile_mount_paths=()
+  declare -gA kwargs=() project_options=() mount_modes=() unsaved_mount_paths=()
   declare -gA mount_given_paths=() link_targets=() link_climbs=()
   declare -ga project_mounts=() mount_paths=() link_paths=()
   project_root="${temporary_directory}/project"
