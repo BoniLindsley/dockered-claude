@@ -212,7 +212,7 @@ test_tool_requires_a_known_subcommand() {
 
 test_help_is_accepted_after_a_command() {
   declare command
-  for command in run build profile tool; do
+  for command in run build profile tool clean; do
     reset_arguments
     capture parse_arguments "${command}" --help
     assert_status 0
@@ -293,4 +293,42 @@ test_profile_commands_take_no_profile() {
   capture parse_arguments profile build --profile minimal default
   assert_status 1
   assert_contains "${errors}" "profile build: unexpected argument '--profile'"
+}
+
+test_clean_takes_targets_and_dry_run() {
+  reset_arguments
+  capture parse_arguments clean tools --list packages
+  assert_status 0
+  assert_equal clean "${kwargs[command]}"
+  assert_equal 1 "${kwargs[dry_run]}"
+  assert_array args tools packages
+}
+
+test_clean_takes_all() {
+  reset_arguments
+  capture parse_arguments clean --dry-run all
+  assert_status 0
+  assert_array args all
+}
+
+test_clean_requires_a_target() {
+  reset_arguments
+  capture parse_arguments clean --dry-run
+  assert_status 1
+  assert_contains "${errors}" \
+    'clean requires a target: containers tools packages profiles or all'
+}
+
+test_clean_refuses_an_unknown_target() {
+  reset_arguments
+  capture parse_arguments clean volumes
+  assert_status 1
+  assert_contains "${errors}" "unknown clean target 'volumes'"
+}
+
+test_clean_refuses_an_unknown_option() {
+  reset_arguments
+  capture parse_arguments clean --force all
+  assert_status 1
+  assert_contains "${errors}" "clean: unexpected argument '--force'"
 }

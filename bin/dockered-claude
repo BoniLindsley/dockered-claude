@@ -12,6 +12,7 @@ Usage: ${script_name} [run] [--profile NAME]
        ${script_name} profile build NAME...
        ${script_name} tool list [--profile NAME]
        ${script_name} tool build [--profile NAME] NAME...
+       ${script_name} clean [--dry-run] TARGET...
        ${script_name} --help
 
 Run Claude Code in an isolated Docker container.
@@ -33,6 +34,24 @@ Commands:
   tool build NAME...      Build or update each tool NAME from
                           tools/NAME/Dockerfile for that profile, as a new
                           generation of its volume
+  clean TARGET...         Offer for removal, one item at a time, what the
+                          launcher left unused; TARGET is one of:
+                          containers  stopped containers left behind
+                          tools       older generations of tool volumes,
+                                      and those of a tool or profile no
+                                      longer defined
+                          packages    packages images (rebuilt when next
+                                      needed)
+                          profiles    profile images replaced by a later
+                                      build, or of a profile no longer
+                                      defined
+                          all         all of the above
+                          Nothing a container uses, running or not, is
+                          offered; images and volumes of earlier versions
+                          of the launcher are offered too
+
+Options of clean:
+  --dry-run, --list       Only list what would be offered
 
 Options of run:
   -h, --help              Show this help (also after any command)
@@ -121,8 +140,7 @@ Mounts:
   same profile and packages share it. It is built from the profile's own
   Dockerfile.packages when it has one, else from the launcher's. It is
   rebuilt with build and whenever the profile's image has changed. Remove
-  unused ones with:
-  docker image prune --all --filter label=dockered-claude.packages
+  unused ones with: ${script_name} clean packages
   (they are rebuilt when next needed). Tools are built on the profile's
   image, without the packages, since they are shared between projects.
 
@@ -184,8 +202,9 @@ Tools:
   /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
   selection order, so the first tool selected wins on name collisions. It
   warns about older generations that no container uses, which can be
-  removed with docker volume rm. Volumes named dockered-claude-tool-NAME,
-  from earlier versions of the launcher, are no longer used.
+  removed with: ${script_name} clean tools. Volumes named
+  dockered-claude-tool-NAME, from earlier versions of the launcher, are no
+  longer used.
 
   The tool claude-code, Claude Code itself, is always mounted, even with
   --no-tools, and its bin/ goes last on PATH, after the image's. Claude
@@ -210,6 +229,7 @@ Examples:
   ${script_name} --no-save --mount ~/Downloads
   ${script_name} --no-mounts
   ${script_name} tool build vcpkg
+  ${script_name} clean --dry-run all
 HELP
 }
 
@@ -243,6 +263,11 @@ parse_arguments() {
   tool)
     shift
     parse_group_arguments tool "$@" || return
+    ;;
+  clean)
+    kwargs[command]=clean
+    shift
+    parse_clean_arguments "$@" || return
     ;;
   -*)
     kwargs[command]=run
@@ -419,6 +444,47 @@ parse_group_arguments() {
     warn "${group} build requires a ${group} name"
     return 1
   fi
+}
+
+# The targets of clean, in the order they are cleaned:
+# containers first, since a leftover container keeps its volumes
+# and images in use.
+declare -a clean_targets=(containers tools packages profiles)
+
+# Set kwargs[dry_run] for --dry-run or --list,
+# and args to the targets of clean, at least one.
+parse_clean_arguments() {
+  declare argument
+  while (($#)); do
+    argument="$1"
+    shift
+    case "${argument}" in
+    -h | --help) kwargs[help]=1 ;;
+    --dry-run | --list) kwargs[dry_run]=1 ;;
+    -?*)
+      warn "clean: unexpected argument '${argument}'"
+      return 1
+      ;;
+    *)
+      validate_clean_target "${argument}" || return
+      args+=("${argument}")
+      ;;
+    esac
+  done
+  if ((${#args[@]} == 0)) && [[ -z "${kwargs[help]+defined}" ]]; then
+    warn "clean requires a target: ${clean_targets[*]} or all"
+    return 1
+  fi
+}
+
+validate_clean_target() {
+  declare name="$1" target
+  for target in all "${clean_targets[@]}"; do
+    [[ "${name}" != "${target}" ]] || return 0
+  done
+  warn "unknown clean target '${name}':" \
+    "expected ${clean_targets[*]} or all"
+  return 1
 }
 
 resolve_paths() {
@@ -1634,6 +1700,241 @@ run_container() {
   exec docker "${docker_args[@]}" "${container_image}" "$@"
 }
 
+# Offer for removal, one item at a time,
+# what the targets of clean in args find unused,
+# or only list it with kwargs[dry_run],
+# cleaning the targets in the order of clean_targets,
+# so that each finds what is unused once the one before is cleaned.
+# Fail when a removal fails, after offering the rest.
+clean_unused() {
+  declare target selected=" ${args[*]} "
+  declare -i offered=0 failed=0
+  declare -a item_kinds item_references item_reasons
+  for target in "${clean_targets[@]}"; do
+    [[ "${selected}" == *" ${target} "* || "${selected}" == *' all '* ]] ||
+      continue
+    item_kinds=()
+    item_references=()
+    item_reasons=()
+    "find_unused_${target}" || return
+    offer_items || return
+  done
+  ((offered > 0)) || warn "nothing to clean"
+  ((failed == 0))
+}
+
+# Add an item for clean to offer:
+# its KIND (container, volume or image), REFERENCE and REASON.
+add_item() {
+  declare kind="$1" reference="$2" reason="$3"
+  item_kinds+=("${kind}")
+  item_references+=("${reference}")
+  item_reasons+=("${reason}")
+}
+
+# Set users to the IDs of the containers, running or not,
+# that docker ps finds with FILTER, such as volume=NAME.
+find_users() {
+  declare filter="$1"
+  users="$(docker ps --all --quiet --filter "${filter}")" || return
+}
+
+# List the items that the finder of a target added,
+# with kwargs[dry_run], or else remove each one confirmed,
+# counting them in offered and the failed removals in failed.
+offer_items() {
+  declare -i index
+  declare item
+  for index in "${!item_kinds[@]}"; do
+    offered+=1
+    item="${item_kinds[index]} ${item_references[index]}"
+    if [[ -n "${kwargs[dry_run]+defined}" ]]; then
+      printf '%s: %s\n' "${item}" "${item_reasons[index]}"
+      continue
+    fi
+    confirm_removal "${item} (${item_reasons[index]})" || continue
+    if remove_item "${item_kinds[index]}" "${item_references[index]}"; then
+      warn "removed ${item}"
+    else
+      failed+=1
+    fi
+  done
+}
+
+# Ask on standard error whether to remove the item DESCRIPTION,
+# reading the answer from standard input,
+# and succeed on yes; the default, and end of input, is no.
+confirm_removal() {
+  declare description="$1" answer
+  printf '%s: remove %s? [y/N] ' "${script_name}" "${description}" >&2
+  if ! read -r answer; then
+    printf '\n' >&2
+    return 1
+  fi
+  [[ "${answer,,}" == y || "${answer,,}" == yes ]]
+}
+
+remove_item() {
+  declare kind="$1" reference="$2"
+  case "${kind}" in
+  container) docker rm "${reference}" >/dev/null ;;
+  volume) docker volume rm "${reference}" >/dev/null ;;
+  image) docker image rm "${reference}" >/dev/null ;;
+  esac
+}
+
+# Add the stopped containers that the launcher left behind:
+# those of its images, which run with --rm,
+# so that one stops only when Docker cannot remove it,
+# and those created to fill a tool volume,
+# which a build removes at once, unless it is interrupted.
+# A running or paused container is never offered.
+find_unused_containers() {
+  declare listing fill_listing id name image
+  declare -A seen=()
+  declare -a stopped=(
+    --filter status=created
+    --filter status=dead
+    --filter status=exited
+  )
+  listing="$(docker ps --all --no-trunc "${stopped[@]}" \
+    --filter label=dockered-claude.profile \
+    --format '{{.ID}} {{.Names}} {{.Image}}')" || return
+  fill_listing="$(docker ps --all --no-trunc "${stopped[@]}" \
+    --filter name=dockered-claude-tool- \
+    --format '{{.ID}} {{.Names}} {{.Image}}')" || return
+
+  while read -r id name image; do
+    [[ -n "${id}" ]] || continue
+    seen[${id}]=1
+    add_item container "${name}" "stopped, of image ${image}"
+  done <<<"${listing}"
+  while read -r id name image; do
+    [[ -n "${id}" && -z "${seen[${id}]+defined}" ]] || continue
+    [[ "${name}" == dockered-claude-tool-*-fill ]] || continue
+    add_item container "${name}" "left from filling ${name%-fill}"
+  done <<<"${fill_listing}"
+}
+
+# Add the tool volumes that no container uses, running or not:
+# older generations of a tool for a profile;
+# all generations of a tool or for a profile no longer defined;
+# and volumes named dockered-claude-tool-NAME, without labels,
+# from earlier versions of the launcher.
+# The newest generation of a defined tool for a defined profile is kept.
+find_unused_tools() {
+  declare listing tool volume_profile generation name key reason users
+  declare -A newest=()
+  listing="$(docker volume ls --filter name=dockered-claude-tool- \
+    --format '{{.Label "dockered-claude.tool"}}/{{.Label "dockered-claude.profile"}}/{{.Label "dockered-claude.generation"}}/{{.Name}}')" ||
+    return
+
+  while IFS=/ read -r tool volume_profile generation name; do
+    [[ "${generation}" =~ ^[1-9][0-9]*$ ]] || continue
+    key="${tool}/${volume_profile}"
+    if ((generation > ${newest[${key}]:-0})); then
+      newest[${key}]="${generation}"
+    fi
+  done <<<"${listing}"
+
+  while IFS=/ read -r tool volume_profile generation name; do
+    [[ "${name}" == dockered-claude-tool-* ]] || continue
+    key="${tool}/${volume_profile}"
+    if [[ -z "${tool}" ]]; then
+      reason='from an earlier version of the launcher'
+    elif [[ ! "${generation}" =~ ^[1-9][0-9]*$ ]]; then
+      continue
+    elif ! tool_defined "${tool}"; then
+      reason="tool '${tool}' is no longer defined"
+    elif ! profile_defined "${volume_profile}"; then
+      reason="profile '${volume_profile}' is no longer defined"
+    elif ((generation < ${newest[${key}]})); then
+      reason="older generation of tool '${tool}' for profile '${volume_profile}'"
+    else
+      continue
+    fi
+    find_users "volume=${name}" || return
+    [[ -z "${users}" ]] || continue
+    add_item volume "${name}" "${reason}"
+  done <<<"${listing}"
+}
+
+# Add the packages images that no container uses, running or not,
+# saying whether a later build replaced one,
+# its profile is no longer defined,
+# it was built from an older image of its profile,
+# or it is current; a run rebuilds one it needs.
+find_unused_packages() {
+  declare listing id reference repository name labels base_image
+  declare package_names current reason users
+  listing="$(docker image ls --no-trunc \
+    --filter label=dockered-claude.packages \
+    --format '{{.ID}} {{.Repository}}:{{.Tag}}')" || return
+
+  while read -r id reference; do
+    [[ -n "${id}" ]] || continue
+    find_users "ancestor=${id}" || return
+    [[ -z "${users}" ]] || continue
+    labels="$(docker image inspect --format \
+      '{{index .Config.Labels "dockered-claude.base-image"}}|{{index .Config.Labels "dockered-claude.packages"}}' \
+      "${id}")" || return
+    IFS='|' read -r base_image package_names <<<"${labels}"
+    repository="${reference%:*}"
+    name="${repository#dockered-claude-}"
+    if [[ "${reference}" == '<none>:<none>' ]]; then
+      reference="${id}"
+      reason='replaced by a later build'
+    elif ! profile_defined "${name}"; then
+      reason="profile '${name}' is no longer defined"
+    elif current="$(docker image inspect --format '{{.Id}}' \
+      "${repository}:latest" 2>/dev/null)" &&
+      [[ "${current}" == "${base_image}" ]]; then
+      reason="current for profile '${name}'"
+    else
+      reason="built from an older image of profile '${name}'"
+    fi
+    add_item image "${reference}" "packages ${package_names}; ${reason}"
+  done <<<"${listing}"
+}
+
+# Add the images of profiles that no container uses, running or not,
+# which a later build replaced or whose profile is no longer defined,
+# and images named dockered-claude, from earlier versions of the launcher.
+# Packages images carry their profile's label too, so they are left out.
+find_unused_profiles() {
+  declare packages_ids listing old_listing id reference repository reason
+  declare users
+  declare -A seen=()
+  packages_ids="$(docker image ls --quiet --no-trunc \
+    --filter label=dockered-claude.packages)" || return
+  listing="$(docker image ls --no-trunc \
+    --filter label=dockered-claude.profile \
+    --format '{{.ID}} {{.Repository}}:{{.Tag}}')" || return
+  old_listing="$(docker image ls --no-trunc \
+    --format '{{.ID}} {{.Repository}}:{{.Tag}}' dockered-claude)" || return
+
+  while read -r id reference; do
+    [[ -n "${id}" && -z "${seen[${reference}]+defined}" ]] || continue
+    seen[${reference}]=1
+    [[ $'\n'"${packages_ids}"$'\n' != *$'\n'"${id}"$'\n'* ]] || continue
+    repository="${reference%:*}"
+    if [[ "${reference}" == '<none>:<none>' ]]; then
+      reference="${id}"
+      reason='replaced by a later build'
+    elif [[ "${repository}" == dockered-claude ]]; then
+      reason='from an earlier version of the launcher'
+    elif [[ "${repository}" == dockered-claude-?* ]] &&
+      ! profile_defined "${repository#dockered-claude-}"; then
+      reason="profile '${repository#dockered-claude-}' is no longer defined"
+    else
+      continue
+    fi
+    find_users "ancestor=${id}" || return
+    [[ -z "${users}" ]] || continue
+    add_item image "${reference}" "${reason}"
+  done <<<"${listing}"$'\n'"${old_listing}"
+}
+
 # Rebuild the image of the project's profile,
 # and the packages image of the project's saved packages.
 build_images() {
@@ -1647,7 +1948,8 @@ build_images() {
 
 # Do the command in kwargs[command]:
 # run Claude Code with args, as the options in kwargs, tools, packages
-# and mounts say; rebuild the images; list tools; or build the tools in args.
+# and mounts say; rebuild the images; list or build profiles or tools;
+# or clean the targets in args.
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
   declare home passwd_file group_file agents_dir config_dir git_config_dir
@@ -1689,6 +1991,10 @@ run() {
     for name in "${args[@]}"; do
       build_tool_volume "${name}" refresh || return
     done
+    return
+    ;;
+  clean)
+    clean_unused
     return
     ;;
   esac
