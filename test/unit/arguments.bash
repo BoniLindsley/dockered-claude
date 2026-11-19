@@ -1,4 +1,8 @@
 # Tests of the launcher's argument parsing.
+# test/run sources test/lib.bash first,
+# which sets launcher and temporary_directory,
+# and whose capture sets output, errors and status.
+# shellcheck disable=SC2154
 
 # shellcheck source=../../bin/dockered-claude
 source -- "${launcher}" || return

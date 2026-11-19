@@ -1,4 +1,8 @@
 # Tests of finding, reading and saving the project configuration.
+# test/run sources test/lib.bash first,
+# which sets launcher and temporary_directory,
+# and whose capture sets output, errors and status.
+# shellcheck disable=SC2154
 
 # shellcheck source=../../bin/dockered-claude
 source -- "${launcher}" || return
@@ -112,7 +116,7 @@ test_saving_mounts_replaces_them_where_the_first_was() {
   reset_configuration
   write_config '# Mine' 'mount = /a' 'tools = uv' 'mount = /b:rw'
   mount_paths=(/c /d)
-  mount_modes=([/c]=ro [/d]=rw)
+  mount_modes=(["/c"]=ro ["/d"]=rw)
   capture save_project_mounts
   assert_status 0
   assert_file "${project_config}" \

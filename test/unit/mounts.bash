@@ -1,4 +1,8 @@
 # Tests of resolving, checking and selecting mounts.
+# test/run sources test/lib.bash first,
+# which sets launcher and temporary_directory,
+# and whose capture sets output, errors and status.
+# shellcheck disable=SC2154
 
 # shellcheck source=../../bin/dockered-claude
 source -- "${launcher}" || return
@@ -27,6 +31,7 @@ reset_selection() {
   project_root="${workdir}"
   project_config="${project_root}/${project_config_path}"
   mkdir -p -- "${workdir}"
+  # shellcheck disable=SC2329 # Called by select_mounts.
   check_mount_path() { :; }
 }
 
@@ -114,8 +119,8 @@ test_adding_a_path_again_keeps_its_place_and_takes_the_new_mode() {
     add_mount
   done
   assert_array mount_paths /srv/a /srv/b
-  assert_equal rw "${mount_modes[/srv/a]}"
-  assert_equal ro "${mount_modes[/srv/b]}"
+  assert_equal rw "${mount_modes["/srv/a"]}"
+  assert_equal ro "${mount_modes["/srv/b"]}"
 }
 
 test_selecting_skips_a_saved_mount_that_is_missing() {
@@ -148,5 +153,5 @@ test_selecting_given_mounts_ignores_saved_ones() {
   capture select_mounts
   assert_status 0
   assert_array mount_paths "${temporary_directory}/given"
-  assert_equal rw "${mount_modes[${temporary_directory}/given]}"
+  assert_equal rw "${mount_modes["${temporary_directory}/given"]}"
 }

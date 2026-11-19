@@ -36,6 +36,7 @@ run_tests() {
       start_test
       "${test}"
     ) >"${log}" 2>&1
+    # shellcheck disable=SC2181 # Read apart from the subshell, as above.
     if (($? == 0)); then
       printf 'ok - %s: %s\n' "${name}" "${test}"
       passed+=1
@@ -68,6 +69,7 @@ start_test() {
 launcher="${repository}/bin/dockered-claude"
 
 # Set the paths that the launcher's main would declare.
+# shellcheck disable=SC2034 # Read by the launcher's functions.
 set_launcher_paths() {
   script_name="${launcher##*/}"
   project_directory="${repository}"
@@ -96,6 +98,7 @@ fail() {
 # Set output and errors to what it printed,
 # without trailing newlines,
 # and status to its exit status.
+# shellcheck disable=SC2034 # Read by the tests.
 capture() {
   declare capture_file="${temporary_directory}/capture"
   if "$@" >"${capture_file}.out" 2>"${capture_file}.err"; then
