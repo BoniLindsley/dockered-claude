@@ -44,7 +44,8 @@ Options of run:
                           for the project)
   -m, --mount PATH[:rw]   Mount PATH at the same path, read-only, or writable
                           with :rw (repeatable; saved for the project)
-  --no-mounts             Mount no paths (saved for the project)
+  --no-mounts             Mount none of the given or saved paths (saved
+                          for the project)
   --no-save               Use these options for this run only
   --                      Pass remaining arguments directly to Claude Code
 
@@ -132,6 +133,27 @@ Profiles:
   The image must provide what Claude Code and the tools need, as
   profiles/default does. A selected profile whose image is missing is
   built before Claude Code starts.
+
+  A profile may also hold launcher.bash, which is sourced before each run
+  in a child bash with set -euo pipefail, in the working directory and
+  without standard input. It may define these functions, each printing
+  one item per line on standard output (blank lines are ignored):
+
+    profile_environment   Names of host variables to pass into the
+                          container; unset ones are skipped. PATH, HOME
+                          and TERM cannot be passed.
+    profile_mounts        Paths to mount, as --mount takes them
+                          (PATH[:rw], relative to the working directory),
+                          with the same checks. A missing one is skipped
+                          with a warning. They are mounted even with
+                          --no-mounts and are never saved; a path given or
+                          saved already keeps its mode.
+    profile_path          Absolute directories to put in front of the
+                          image's PATH, in order, after the tools' bin/.
+
+  An error in the script or in a function stops the launch. What the script
+  prints on standard output is read as items too, so messages belong on
+  standard error.
 
 Tools:
   Each tool is a directory tools/NAME next to the launcher's bin/, holding
@@ -586,6 +608,89 @@ add_mount() {
   mount_modes[${mount_path}]="${mount_mode}"
 }
 
+# Print what FUNCTION of the profile's launcher.bash prints,
+# calling it in a child bash with standard input closed;
+# print nothing when the profile has no launcher.bash
+# or the script does not define FUNCTION.
+# Errexit is set before sourcing,
+# and the function is called as a command of its own,
+# so that errexit applies inside it too.
+call_profile_function() {
+  declare function="$1"
+  declare script="${project_directory}/profiles/${profile}/launcher.bash"
+  [[ -f "${script}" ]] || return 0
+  # shellcheck disable=SC2016 # Expanded by the child bash.
+  if ! bash -c 'set -euo pipefail
+source -- "$1"
+declare -F "$2" >/dev/null || exit 0
+"$2"' bash "${script}" "${function}" </dev/null; then
+    warn "${script}: ${function} failed"
+    return 1
+  fi
+}
+
+# Set lines to the lines that FUNCTION of the profile's launcher.bash prints,
+# without blank ones.
+read_profile_function() {
+  declare function="$1" output line
+  lines=()
+  output="$(call_profile_function "${function}")" || return
+  [[ -n "${output}" ]] || return 0
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] || lines+=("${line}")
+  done <<<"${output}"
+}
+
+# Read what the functions of the profile's launcher.bash print:
+# set profile_variables to the host variables named that are set,
+# add the existing paths to mount that are not mounted already,
+# marking them in profile_mount_paths so that they are never saved,
+# and set profile_path_entries to the directories for PATH.
+read_profile_launcher() {
+  declare script="${project_directory}/profiles/${profile}/launcher.bash"
+  declare line mount_path mount_mode
+  declare -a lines
+
+  read_profile_function profile_environment || return
+  for line in "${lines[@]}"; do
+    if [[ ! "${line}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ||
+      "${line}" == PATH || "${line}" == HOME || "${line}" == TERM ]]; then
+      warn "${script}: profile_environment: cannot pass '${line}'"
+      return 1
+    fi
+    [[ -z "${!line+defined}" ]] || profile_variables+=("${line}")
+  done
+
+  read_profile_function profile_mounts || return
+  for line in "${lines[@]}"; do
+    if ! validate_mount_spec "${line}"; then
+      warn "${script}: profile_mounts: invalid mount"
+      return 1
+    fi
+    resolve_mount_spec "${line}" "${workdir}" || return
+    if [[ ! -e "${mount_path}" ]]; then
+      warn "skipping profile mount '${mount_path}': it does not exist"
+      continue
+    fi
+    [[ -z "${mount_modes[${mount_path}]+defined}" ]] || continue
+    if ! add_mount; then
+      warn "${script}: profile_mounts: cannot mount '${mount_path}'"
+      return 1
+    fi
+    profile_mount_paths[${mount_path}]=1
+  done
+
+  read_profile_function profile_path || return
+  for line in "${lines[@]}"; do
+    if [[ "${line}" != /* || "${line}" == *:* ]]; then
+      warn "${script}: profile_path: invalid entry '${line}':" \
+        "it must be absolute and contain no colons"
+      return 1
+    fi
+    profile_path_entries+=("${line}")
+  done
+}
+
 # Succeed when tools/TOOL holds a Dockerfile to build the tool from.
 tool_defined() {
   declare tool="$1"
@@ -778,6 +883,7 @@ save_project_option() {
 }
 
 # Save the mounts in mount_paths, given with --mount or --no-mounts,
+# except those of the profile, in profile_mount_paths,
 # as "mount = PATH[:rw]" lines with their absolute paths
 # if they differ from the saved ones,
 # replacing all mount lines where the first one was
@@ -788,6 +894,7 @@ save_project_mounts() {
   declare -a config_lines settings=() old_settings=() new_lines=()
 
   for mount_path in "${mount_paths[@]}"; do
+    [[ -z "${profile_mount_paths[${mount_path}]+defined}" ]] || continue
     line="mount = ${mount_path}"
     [[ "${mount_modes[${mount_path}]}" == ro ]] || line+=":rw"
     settings+=("${line}")
@@ -1129,6 +1236,16 @@ add_tool_arguments() {
   docker_args+=("${env_args[@]}")
 }
 
+# Pass the host variables in profile_variables,
+# and add profile_path_entries to path_entries, after the tools.
+add_profile_arguments() {
+  declare variable
+  for variable in "${profile_variables[@]}"; do
+    docker_args+=(--env "${variable}")
+  done
+  path_entries+=("${profile_path_entries[@]}")
+}
+
 # Put path_entries, in order, in front of the PATH of container_image.
 add_path_argument() {
   ((${#path_entries[@]} > 0)) || return 0
@@ -1232,6 +1349,7 @@ run_container() {
   declare -a docker_args=() path_entries=()
   add_base_arguments || return
   add_tool_arguments || return
+  add_profile_arguments || return
   add_path_argument || return
   docker_args+=(
     --env "HOME=${home}"
@@ -1318,7 +1436,8 @@ run() {
   declare home passwd_file group_file agents_dir config_dir git_config_dir
   declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=()
-  declare -A project_options=() mount_modes=()
+  declare -a profile_variables=() profile_path_entries=()
+  declare -A project_options=() mount_modes=() profile_mount_paths=()
 
   declare name
 
@@ -1362,6 +1481,7 @@ run() {
   select_tools || return
   select_packages || return
   select_mounts || return
+  read_profile_launcher || return
   prepare_mount_points || return
   prepare_user_identity || return
   link_agent_skills || return

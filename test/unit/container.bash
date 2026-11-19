@@ -48,3 +48,20 @@ test_without_path_entries_the_image_path_is_kept() {
   assert_status 0
   assert_array docker_args
 }
+
+test_profile_variables_are_passed_and_its_path_follows_the_tools() {
+  reset_container
+  tools=(uv)
+  declare -ga profile_variables=(SDK_HOME) profile_path_entries=(/opt/sdk/bin)
+  capture add_tool_arguments
+  assert_status 0
+  capture add_profile_arguments
+  assert_status 0
+  capture add_path_argument
+  assert_status 0
+  assert_array docker_args \
+    --mount type=volume,src=dockered-claude-tool-uv,dst=/opt/tools/uv,readonly \
+    --env-file "${project_directory}/tools/uv/env" \
+    --env SDK_HOME \
+    --env PATH=/opt/tools/uv/bin:/opt/sdk/bin:/usr/local/bin:/usr/bin
+}
