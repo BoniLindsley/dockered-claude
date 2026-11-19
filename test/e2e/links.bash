@@ -24,10 +24,11 @@ start_links_test() {
 
 # Build an image from e2e_image with the directories given,
 # each holding a file named image-file, and set container_image to its ID.
+# A profile image may build as another user, who cannot write in /home.
 build_base_image() {
   declare directory
   {
-    printf 'FROM %s\n' "${e2e_image}"
+    printf 'FROM %s\nUSER root\n' "${e2e_image}"
     for directory in "$@"; do
       printf 'RUN mkdir -p %q && touch %q\n' \
         "${directory}" "${directory}/image-file"
