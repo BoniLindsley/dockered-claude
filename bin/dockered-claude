@@ -7,9 +7,9 @@ Usage: ${script_name} [run] [--profile NAME]
                          [--package NAME | --no-packages]...
                          [--mount PATH[:rw] | --no-mounts]... [--no-save]
                          [--] [claude arguments...]
-       ${script_name} build
+       ${script_name} build [--no-cache]
        ${script_name} profile list
-       ${script_name} profile build NAME...
+       ${script_name} profile build [--no-cache] NAME...
        ${script_name} tool list [--profile NAME]
        ${script_name} tool build [--profile NAME] NAME...
        ${script_name} clean [--dry-run] TARGET...
@@ -51,6 +51,11 @@ Commands:
                           Nothing a container uses, running or not, is
                           offered; images and volumes of earlier versions
                           of the launcher are offered too
+
+Options of build and profile build:
+  --no-cache              Build without Docker's build cache, so that every
+                          step runs again, such as one installing updates;
+                          the result is always a new generation
 
 Options of clean:
   --dry-run, --list       Only list what would be offered
@@ -273,7 +278,7 @@ parse_arguments() {
   build)
     kwargs[command]=build
     shift
-    parse_no_arguments build "$@" || return
+    parse_build_arguments "$@" || return
     ;;
   profile)
     shift
@@ -388,15 +393,15 @@ parse_run_arguments() {
   done
 }
 
-# Parse the arguments of command, which takes only --help.
-parse_no_arguments() {
-  declare command="$1" argument
-  shift
+# Set kwargs[no_cache] for --no-cache, the only option of build.
+parse_build_arguments() {
+  declare argument
   for argument in "$@"; do
     case "${argument}" in
     -h | --help) kwargs[help]=1 ;;
+    --no-cache) kwargs[no_cache]=1 ;;
     *)
-      warn "${command}: unexpected argument '${argument}'"
+      warn "build: unexpected argument '${argument}'"
       return 1
       ;;
     esac
@@ -407,7 +412,8 @@ parse_no_arguments() {
 # and args to the names to build,
 # for the commands GROUP list and GROUP build NAME...,
 # where GROUP names its validate_GROUP_name function.
-# The tool commands also take --profile NAME.
+# The tool commands also take --profile NAME,
+# and profile build takes --no-cache, setting kwargs[no_cache].
 parse_group_arguments() {
   declare group="$1" command argument
   shift
@@ -446,6 +452,13 @@ parse_group_arguments() {
       validate_profile_name "$1" || return
       kwargs[profile]="$1"
       shift
+      ;;
+    --no-cache)
+      if [[ "${group} ${command}" != 'profile build' ]]; then
+        warn "${group} ${command}: unexpected argument '${argument}'"
+        return 1
+      fi
+      kwargs[no_cache]=1
       ;;
     *)
       if [[ "${command}" == list ]]; then
@@ -1424,6 +1437,7 @@ build_image() {
   if ! docker build \
     --iidfile "${id_file}" \
     --label "dockered-claude.profile=${profile}" \
+    ${kwargs[no_cache]:+--no-cache} \
     --pull \
     "${project_directory}/profiles/${profile}"; then
     rm -f -- "${id_file}"
@@ -1500,6 +1514,7 @@ ensure_packages_image() {
     --build-arg "PACKAGES=${names}" \
     --file "${file}" \
     --label "dockered-claude.profile=${profile}" \
+    ${kwargs[no_cache]:+--no-cache} \
     --tag "${container_image}" \
     "${file%/*}" || return
 }

@@ -84,6 +84,15 @@ docker tag sha256:new dockered-claude-default:latest"
   assert_contains "${errors}" "built generation 1 of profile 'default'"
 }
 
+test_building_a_profile_without_the_cache_passes_no_cache() {
+  reset_profile_images
+  kwargs[no_cache]=1
+  capture build_image
+  assert_status 0
+  assert_contains "$(<"${calls}")" \
+    "docker build --label dockered-claude.profile=default --no-cache --pull "
+}
+
 test_building_a_profile_adds_a_generation_after_the_newest() {
   reset_profile_images
   fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\n3 sha256:c 2 days ago\nlatest sha256:a 2 weeks ago\n'

@@ -156,7 +156,7 @@ test_options_that_became_commands_are_refused() {
   done
 }
 
-test_build_takes_no_arguments() {
+test_build_takes_no_other_arguments() {
   reset_arguments
   capture parse_arguments build
   assert_status 0
@@ -286,6 +286,31 @@ test_tool_list_takes_no_names() {
   capture parse_arguments tool list uv
   assert_status 1
   assert_contains "${errors}" "tool list: unexpected argument 'uv'"
+}
+
+test_build_commands_take_no_cache() {
+  reset_arguments
+  capture parse_arguments build --no-cache
+  assert_status 0
+  assert_equal 1 "${kwargs[no_cache]}"
+
+  reset_arguments
+  capture parse_arguments profile build --no-cache default
+  assert_status 0
+  assert_equal 1 "${kwargs[no_cache]}"
+  assert_array args default
+}
+
+test_only_build_commands_take_no_cache() {
+  reset_arguments
+  capture parse_arguments tool build --no-cache uv
+  assert_status 1
+  assert_contains "${errors}" "tool build: unexpected argument '--no-cache'"
+
+  reset_arguments
+  capture parse_arguments profile list --no-cache
+  assert_status 1
+  assert_contains "${errors}" "profile list: unexpected argument '--no-cache'"
 }
 
 test_profile_commands_take_no_profile() {
