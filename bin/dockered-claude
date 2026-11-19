@@ -1099,12 +1099,12 @@ add_base_arguments() {
 }
 
 # Mount each selected tool's volume read-only at /opt/tools/<name>
-# and put its bin/ in front of the image's PATH, in selection order.
+# and add its bin/ to path_entries, in selection order.
 # A tool's env file, if any, is passed with --env-file.
 # Later files override earlier ones,
 # so they are passed in reverse order to let the first tool win.
 add_tool_arguments() {
-  declare env_file image_path tool tool_path=''
+  declare env_file tool
   declare -a env_args=()
   declare -A seen=()
 
@@ -1112,7 +1112,7 @@ add_tool_arguments() {
     [[ -z "${seen[${tool}]+defined}" ]] || continue
     seen[${tool}]=1
     check_tool_defined "${tool}" || return
-    tool_path+="/opt/tools/${tool}/bin:"
+    path_entries+=("/opt/tools/${tool}/bin")
     env_file="${project_directory}/tools/${tool}/env"
     if [[ -f "${env_file}" ]]; then
       if grep -Eq '^[[:space:]]*PATH([[:space:]]*=|[[:space:]]*$)' "${env_file}"; then
@@ -1126,8 +1126,13 @@ add_tool_arguments() {
     )
   done
 
-  [[ -n "${tool_path}" ]] || return 0
   docker_args+=("${env_args[@]}")
+}
+
+# Put path_entries, in order, in front of the PATH of container_image.
+add_path_argument() {
+  ((${#path_entries[@]} > 0)) || return 0
+  declare image_path entries
   image_path="$(docker image inspect \
     --format '{{range .Config.Env}}{{println .}}{{end}}' "${container_image}" |
     sed -n 's/^PATH=//p')" || return
@@ -1135,7 +1140,8 @@ add_tool_arguments() {
     warn "cannot determine the PATH of image ${container_image}"
     return 1
   fi
-  docker_args+=(--env "PATH=${tool_path}${image_path}")
+  entries="$(IFS=: && printf '%s' "${path_entries[*]}")" || return
+  docker_args+=(--env "PATH=${entries}:${image_path}")
 }
 
 # Build tools/TOOL/Dockerfile on the base image
@@ -1223,9 +1229,10 @@ fill_tool_volume() {
 }
 
 run_container() {
-  declare -a docker_args=()
+  declare -a docker_args=() path_entries=()
   add_base_arguments || return
   add_tool_arguments || return
+  add_path_argument || return
   docker_args+=(
     --env "HOME=${home}"
     --mount "type=bind,src=${state_dir}/home,dst=/home"
