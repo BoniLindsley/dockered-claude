@@ -199,8 +199,15 @@ test_tool_list_shows_which_tools_are_built() {
   : >"${project_directory}/tools/missing/Dockerfile"
   # shellcheck disable=SC2329 # Called by list_tools.
   docker() {
-    [[ "$*" != *'label=dockered-claude.tool=built '*'label=dockered-claude.profile=default '* ]] ||
-      printf '%s\n' '1 dockered-claude-tool-default-built-1'
+    case "$*" in
+    'image ls '*) printf '%s\n' 'latest sha256:base now' '1 sha256:base now' ;;
+    *'label=dockered-claude.tool=built '*'label=dockered-claude.profile=default '*)
+      printf '%s\n' '1/sha256:base/dockered-claude-tool-default-1-built-1'
+      ;;
+    *'label=dockered-claude.tool=missing '*)
+      printf '%s\n' '1/sha256:old/dockered-claude-tool-default-1-missing-1'
+      ;;
+    esac
   }
   parse_arguments tool list
   capture run
@@ -212,6 +219,8 @@ test_tool_build_builds_each_tool_without_the_cache() {
   reset_commands
   # shellcheck disable=SC2329 # Called by run.
   ensure_image() { record_call; }
+  # shellcheck disable=SC2329 # Called by run.
+  read_profile_image() { :; }
   # shellcheck disable=SC2329 # Called by run.
   build_tool_volume() { record_call "$@"; }
   parse_arguments tool build vcpkg uv
@@ -349,6 +358,8 @@ test_tool_build_uses_the_given_profile() {
   # shellcheck disable=SC2329 # Called by run.
   ensure_image() { record_call "${image}"; }
   # shellcheck disable=SC2329 # Called by run.
+  read_profile_image() { :; }
+  # shellcheck disable=SC2329 # Called by run.
   build_tool_volume() { record_call "$@"; }
   parse_arguments tool build --profile minimal uv
   capture run
@@ -364,6 +375,8 @@ test_tool_build_uses_the_profile_of_the_environment() {
   DOCKERED_CLAUDE_PROFILE=minimal
   # shellcheck disable=SC2329 # Called by run.
   ensure_image() { record_call "${image}"; }
+  # shellcheck disable=SC2329 # Called by run.
+  read_profile_image() { :; }
   # shellcheck disable=SC2329 # Called by run.
   build_tool_volume() { record_call "$@"; }
   parse_arguments tool build uv

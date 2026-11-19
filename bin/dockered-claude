@@ -44,9 +44,11 @@ Commands:
   clean TARGET...         Offer for removal, one item at a time, what the
                           launcher left unused; TARGET is one of:
                           containers  stopped containers left behind
-                          tools       older generations of tool volumes,
-                                      and those of a tool or profile no
-                                      longer defined
+                          tools       older generations of tool volumes
+                                      built from the same profile image,
+                                      those built from a profile image no
+                                      longer there, and those of a tool or
+                                      profile no longer defined
                           packages    packages images (rebuilt when next
                                       needed)
                           profiles    generations of profile images that
@@ -215,20 +217,27 @@ Tools:
   stage holds only that directory (FROM scratch, then COPY --from). The
   launcher copies it into a new volume and removes the image, so the
   volume is the only copy. Each build of a tool for a profile is a new
-  generation, in the volume dockered-claude-tool-PROFILE-NAME-GENERATION,
-  labelled dockered-claude.tool, .profile and .generation, so a rebuild
-  leaves running containers alone. A selected tool without a volume for
-  the profile is built before Claude Code starts. tool build rebuilds it
-  without the build cache, which updates tools that download their latest
-  release.
+  generation, in the volume
+  dockered-claude-tool-PROFILE-PGEN-NAME-GENERATION, PGEN being the
+  generation of the profile's image it was built from, labelled
+  dockered-claude.tool, .profile, .generation, .base-image and
+  .profile-generation, so a rebuild leaves running containers alone.
+
+  A run uses only tool volumes built from the image that the profile's
+  latest marks, and builds a selected tool without one before Claude Code
+  starts, as after each new generation of the profile. Marking an earlier
+  generation latest uses the tool volumes built from it again, if they
+  were kept. Volumes built before tool volumes were tied to profile images
+  are not used. tool build rebuilds a tool without the build cache, which
+  updates tools that download their latest release.
 
   A tool that writes its version to /opt/tools/NAME/version gets the
-  volume dockered-claude-tool-PROFILE-NAME-VERSION instead, labelled
-  dockered-claude.version too, and a version built already is kept rather
-  than built again. A tool may also hold latest-version, a sh script
-  printing the version a build would install, which tool build runs in a
-  container of the profile's image first, skipping the build when that
-  version is built already.
+  volume dockered-claude-tool-PROFILE-PGEN-NAME-VERSION instead, labelled
+  dockered-claude.version too, and a version built already from the same
+  profile image is kept rather than built again. A tool may also hold
+  latest-version, a sh script printing the version a build would install,
+  which tool build runs in a container of the profile's image first,
+  skipping the build when that version is built already.
 
   A run mounts the newest generation of each selected tool read-only at
   /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
@@ -892,31 +901,56 @@ tool_defined() {
   [[ -f "${project_directory}/tools/${tool}/Dockerfile" ]]
 }
 
-# Set tool_volumes to the volumes of TOOL for the profile,
+# Set tool_volumes to the volumes of TOOL for the profile
+# built from the profile image profile_image_id,
 # oldest generation first,
-# and tool_generations to their generations.
+# tool_generations to their generations,
+# and tool_newest_generation to the newest generation of TOOL
+# for the profile, from any image, or 0.
 # Volumes are found by their labels,
 # since tool and profile names may hold the dashes that separate them.
 find_tool_volumes() {
-  declare tool="$1" listing generation name
+  declare tool="$1" listing generation base name
   tool_volumes=()
   tool_generations=()
+  tool_newest_generation=0
   listing="$(docker volume ls \
     --filter "label=dockered-claude.tool=${tool}" \
     --filter "label=dockered-claude.profile=${profile}" \
-    --format '{{.Label "dockered-claude.generation"}} {{.Name}}')" || return
+    --format '{{.Label "dockered-claude.generation"}}/{{.Label "dockered-claude.base-image"}}/{{.Name}}')" ||
+    return
   listing="$(sort -n <<<"${listing}")" || return
-  while read -r generation name; do
+  while IFS=/ read -r generation base name; do
     [[ "${generation}" =~ ^[1-9][0-9]*$ ]] || continue
+    tool_newest_generation=${generation}
+    [[ -n "${base}" && "${base}" == "${profile_image_id}" ]] || continue
     tool_generations+=("${generation}")
     tool_volumes+=("${name}")
   done <<<"${listing}"
 }
 
-# A tool is built for the profile once it has a volume.
+# Set profile_image_id to the ID of the image that latest marks,
+# and profile_generation to its generation,
+# both to nothing when the profile has no such image.
+read_profile_image() {
+  declare latest_id generation
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
+  profile_image_id=''
+  profile_generation=''
+  find_profile_generations || return
+  [[ -n "${latest_id}" ]] || return 0
+  find_generation_of "${latest_id}"
+  profile_image_id="${latest_id}"
+  profile_generation="${generation}"
+}
+
+# A tool is built for the profile
+# once it has a volume built from profile_image_id.
 tool_built() {
   declare tool="$1"
   declare -a tool_volumes tool_generations
+  declare tool_newest_generation
   find_tool_volumes "${tool}" || return
   ((${#tool_volumes[@]} > 0))
 }
@@ -930,11 +964,12 @@ check_tool_defined() {
 }
 
 # Set tool_volume_names, by tool, to the newest volume
-# of each tool in mounted_tools for the profile,
-# building those that have none.
+# of each tool in mounted_tools built from profile_image_id,
+# building those that have none,
+# as after a new build of the profile.
 # A volume left from a tool whose directory was removed is not used.
 find_tool_volume_names() {
-  declare tool
+  declare tool tool_newest_generation
   declare -a tool_volumes tool_generations
   for tool in "${mounted_tools[@]}"; do
     [[ -z "${tool_volume_names[${tool}]+defined}" ]] || continue
@@ -953,9 +988,10 @@ find_tool_volume_names() {
   done
 }
 
-# Warn about older volumes of mounted_tools that no container uses.
+# Warn about older volumes of mounted_tools
+# built from profile_image_id that no container uses.
 warn_unused_tool_volumes() {
-  declare tool volume containers
+  declare tool volume containers tool_newest_generation
   declare -a tool_volumes tool_generations unused=()
   declare -A seen=()
   for tool in "${mounted_tools[@]}"; do
@@ -1735,18 +1771,21 @@ add_path_argument() {
 }
 
 # Print, one per line, the volumes of TOOL for the profile
-# that hold VERSION.
+# built from profile_image_id that hold VERSION.
 find_version_volumes() {
   declare tool="$1" version="$2"
   docker volume ls --quiet \
     --filter "label=dockered-claude.tool=${tool}" \
     --filter "label=dockered-claude.profile=${profile}" \
-    --filter "label=dockered-claude.version=${version}"
+    --filter "label=dockered-claude.version=${version}" \
+    --filter "label=dockered-claude.base-image=${profile_image_id}"
 }
 
 # Build tools/TOOL/Dockerfile on the profile's image
 # and copy the prefix it holds, /opt/tools/TOOL,
-# into a new volume, the next generation of the tool for the profile.
+# into a new volume, the next generation of the tool for the profile,
+# named and labelled by the generation of the profile image,
+# profile_generation, and its ID, profile_image_id.
 # The image is untagged and removed afterwards,
 # so the volume is the only copy of the tool.
 # With REFRESH, the build cache is not used,
@@ -1757,7 +1796,7 @@ build_tool_volume() {
   declare directory="${project_directory}/tools/${tool}"
   declare prefix="/opt/tools/${tool}"
   declare temporary_directory tool_image generation volume tool_version
-  declare latest_version existing
+  declare latest_version existing tool_newest_generation
   declare -a tool_volumes tool_generations
 
   if [[ ! -f "${directory}/Dockerfile" ]]; then
@@ -1791,10 +1830,9 @@ build_tool_volume() {
   # A tool that gives its version is named by it,
   # and a version built already is kept rather than built again.
   if read_tool_version && find_tool_volumes "${tool}"; then
-    generation=1
-    ((${#tool_generations[@]} == 0)) ||
-      generation=$((tool_generations[-1] + 1))
-    volume="dockered-claude-tool-${profile}-${tool}-${tool_version:-${generation}}"
+    generation=$((tool_newest_generation + 1))
+    volume="dockered-claude-tool-${profile}-${profile_generation}-${tool}"
+    volume+="-${tool_version:-${generation}}"
     if [[ -n "${tool_version}" ]] &&
       existing="$(find_version_volumes "${tool}" "${tool_version}")" &&
       [[ -n "${existing}" ]]; then
@@ -1881,13 +1919,16 @@ read_tool_version() {
 # shows whether this fill created the volume
 # or found one made by another build.
 # Reads tool, profile, generation, tool_version, volume, prefix
-# and tool_image from build_tool_volume.
+# and tool_image from build_tool_volume,
+# and profile_image_id and profile_generation.
 fill_tool_volume() {
   declare filler="${volume}-fill" build created_by label
   declare mount="type=volume,src=${volume},dst=${prefix}"
   build="$$-${RANDOM}-${RANDOM}"
   for label in "tool=${tool}" "profile=${profile}" \
     "generation=${generation}" "build=${build}" \
+    "base-image=${profile_image_id}" \
+    "profile-generation=${profile_generation}" \
     ${tool_version:+"version=${tool_version}"}; do
     mount+=",volume-label=dockered-claude.${label}"
   done
@@ -2105,29 +2146,35 @@ find_unused_containers() {
 }
 
 # Add the tool volumes that no container uses, running or not:
-# older generations of a tool for a profile;
+# older generations of a tool built from the same profile image;
+# volumes built from a profile image that no longer exists,
+# or before tool volumes were tied to profile images;
 # all generations of a tool or for a profile no longer defined;
 # and volumes named dockered-claude-tool-NAME, without labels,
 # from earlier versions of the launcher.
-# The newest generation of a defined tool for a defined profile is kept.
+# The newest generation of a defined tool
+# built from each existing image of a defined profile is kept,
+# so that marking that image latest again finds its tools.
 find_unused_tools() {
-  declare listing tool volume_profile generation name key reason users
+  declare listing image_ids tool volume_profile generation base
+  declare base_generation name key reason users
   declare -A newest=()
   listing="$(docker volume ls --filter name=dockered-claude-tool- \
-    --format '{{.Label "dockered-claude.tool"}}/{{.Label "dockered-claude.profile"}}/{{.Label "dockered-claude.generation"}}/{{.Name}}')" ||
+    --format '{{.Label "dockered-claude.tool"}}/{{.Label "dockered-claude.profile"}}/{{.Label "dockered-claude.generation"}}/{{.Label "dockered-claude.base-image"}}/{{.Label "dockered-claude.profile-generation"}}/{{.Name}}')" ||
     return
+  image_ids="$(docker image ls --all --no-trunc --quiet)" || return
 
-  while IFS=/ read -r tool volume_profile generation name; do
+  while IFS=/ read -r tool volume_profile generation base base_generation name; do
     [[ "${generation}" =~ ^[1-9][0-9]*$ ]] || continue
-    key="${tool}/${volume_profile}"
+    key="${tool}/${volume_profile}/${base}"
     if ((generation > ${newest[${key}]:-0})); then
       newest[${key}]="${generation}"
     fi
   done <<<"${listing}"
 
-  while IFS=/ read -r tool volume_profile generation name; do
+  while IFS=/ read -r tool volume_profile generation base base_generation name; do
     [[ "${name}" == dockered-claude-tool-* ]] || continue
-    key="${tool}/${volume_profile}"
+    key="${tool}/${volume_profile}/${base}"
     if [[ -z "${tool}" ]]; then
       reason='from an earlier version of the launcher'
     elif [[ ! "${generation}" =~ ^[1-9][0-9]*$ ]]; then
@@ -2136,8 +2183,14 @@ find_unused_tools() {
       reason="tool '${tool}' is no longer defined"
     elif ! profile_defined "${volume_profile}"; then
       reason="profile '${volume_profile}' is no longer defined"
+    elif [[ -z "${base}" ]]; then
+      reason="built before tool volumes were tied to profile images"
+    elif [[ $'\n'"${image_ids}"$'\n' != *$'\n'"${base}"$'\n'* ]]; then
+      reason="built from generation ${base_generation}"
+      reason+=" of profile '${volume_profile}', which no longer exists"
     elif ((generation < ${newest[${key}]})); then
-      reason="older generation of tool '${tool}' for profile '${volume_profile}'"
+      reason="older generation of tool '${tool}'"
+      reason+=" for generation ${base_generation} of profile '${volume_profile}'"
     else
       continue
     fi
@@ -2257,7 +2310,7 @@ build_images() {
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
   declare home passwd_file group_file agents_dir config_dir git_config_dir
-  declare managed_settings_file
+  declare managed_settings_file profile_image_id profile_generation
   declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=()
   declare -a profile_variables=() profile_path_entries=()
@@ -2297,12 +2350,14 @@ run() {
     ;;
   tool-list)
     select_profile || return
+    read_profile_image || return
     list_tools
     return
     ;;
   tool-build)
     select_profile || return
     ensure_image || return
+    read_profile_image || return
     for name in "${args[@]}"; do
       build_tool_volume "${name}" refresh || return
     done
@@ -2329,6 +2384,7 @@ run() {
   link_agent_skills || return
   link_config_files || return
   ensure_image || return
+  read_profile_image || return
   find_tool_volume_names || return
   warn_unused_tool_volumes || return
   ensure_packages_image || return

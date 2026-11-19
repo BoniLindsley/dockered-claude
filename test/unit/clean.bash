@@ -27,6 +27,7 @@ reset_clean() {
   fake_stopped_containers=''
   fake_fill_containers=''
   fake_volume_listing=''
+  fake_image_ids=sha256:base
   fake_packages_listing=''
   fake_profile_listing=''
   fake_old_listing=''
@@ -50,6 +51,7 @@ docker() {
     printf '%s' "${fake_fill_containers}"
     ;;
   'volume ls '*) printf '%s' "${fake_volume_listing}" ;;
+  'image ls --all --no-trunc --quiet') printf '%s\n' "${fake_image_ids}" ;;
   'image ls --quiet '*)
     [[ -z "${fake_packages_listing}" ]] || cut -d ' ' -f 1 <<<"${fake_packages_listing}"
     ;;
@@ -77,11 +79,11 @@ test_dry_run_lists_without_removing() {
   reset_clean
   kwargs[dry_run]=1
   args=(tools)
-  fake_volume_listing=$'uv/default/1/dockered-claude-tool-default-uv-1\nuv/default/2/dockered-claude-tool-default-uv-2\n'
+  fake_volume_listing=$'uv/default/1/sha256:base/1/dockered-claude-tool-default-uv-1\nuv/default/2/sha256:base/1/dockered-claude-tool-default-uv-2\n'
   capture clean_unused
   assert_status 0
   assert_equal \
-    "volume dockered-claude-tool-default-uv-1: older generation of tool 'uv' for profile 'default'" \
+    "volume dockered-claude-tool-default-uv-1: older generation of tool 'uv' for generation 1 of profile 'default'" \
     "${output}"
   assert_file "${calls}" ''
 }
@@ -89,19 +91,19 @@ test_dry_run_lists_without_removing() {
 test_removes_only_what_is_confirmed() {
   reset_clean
   args=(tools)
-  fake_volume_listing=$'uv/default/1/dockered-claude-tool-default-uv-1\nuv/default/2/dockered-claude-tool-default-uv-2\nuv/default/3/dockered-claude-tool-default-uv-3\n'
+  fake_volume_listing=$'uv/default/1/sha256:base/1/dockered-claude-tool-default-uv-1\nuv/default/2/sha256:base/1/dockered-claude-tool-default-uv-2\nuv/default/3/sha256:base/1/dockered-claude-tool-default-uv-3\n'
   capture clean_unused <<<$'y\nn'
   assert_status 0
   assert_file "${calls}" 'volume rm dockered-claude-tool-default-uv-1'
   assert_contains "${errors}" \
-    "remove volume dockered-claude-tool-default-uv-1 (older generation of tool 'uv' for profile 'default')? [y/N]"
+    "remove volume dockered-claude-tool-default-uv-1 (older generation of tool 'uv' for generation 1 of profile 'default')? [y/N]"
   assert_contains "${errors}" 'removed volume dockered-claude-tool-default-uv-1'
 }
 
 test_end_of_input_removes_nothing() {
   reset_clean
   args=(tools)
-  fake_volume_listing=$'uv/default/1/dockered-claude-tool-default-uv-1\nuv/default/2/dockered-claude-tool-default-uv-2\n'
+  fake_volume_listing=$'uv/default/1/sha256:base/1/dockered-claude-tool-default-uv-1\nuv/default/2/sha256:base/1/dockered-claude-tool-default-uv-2\n'
   capture clean_unused </dev/null
   assert_status 0
   assert_file "${calls}" ''
@@ -110,7 +112,7 @@ test_end_of_input_removes_nothing() {
 test_a_failed_removal_fails_after_the_rest() {
   reset_clean
   args=(tools)
-  fake_volume_listing=$'uv/default/1/dockered-claude-tool-default-uv-1\nuv/default/2/dockered-claude-tool-default-uv-2\nuv/default/3/dockered-claude-tool-default-uv-3\n'
+  fake_volume_listing=$'uv/default/1/sha256:base/1/dockered-claude-tool-default-uv-1\nuv/default/2/sha256:base/1/dockered-claude-tool-default-uv-2\nuv/default/3/sha256:base/1/dockered-claude-tool-default-uv-3\n'
   fake_failing["dockered-claude-tool-default-uv-1"]=1
   capture clean_unused <<<$'y\ny'
   assert_status 1
@@ -124,12 +126,12 @@ test_tools_keeps_the_newest_and_what_containers_use() {
   : >"${project_directory}/profiles/minimal/Dockerfile"
   kwargs[dry_run]=1
   args=(tools)
-  fake_volume_listing=$'uv/default/9/dockered-claude-tool-default-uv-9\nuv/default/10/dockered-claude-tool-default-uv-10\nuv/default/8/dockered-claude-tool-default-uv-8\nuv/minimal/1/dockered-claude-tool-minimal-uv-1\n'
+  fake_volume_listing=$'uv/default/9/sha256:base/1/dockered-claude-tool-default-uv-9\nuv/default/10/sha256:base/1/dockered-claude-tool-default-uv-10\nuv/default/8/sha256:base/1/dockered-claude-tool-default-uv-8\nuv/minimal/1/sha256:base/1/dockered-claude-tool-minimal-uv-1\n'
   fake_users_of["volume=dockered-claude-tool-default-uv-8"]=container
   capture clean_unused
   assert_status 0
   assert_equal \
-    "volume dockered-claude-tool-default-uv-9: older generation of tool 'uv' for profile 'default'" \
+    "volume dockered-claude-tool-default-uv-9: older generation of tool 'uv' for generation 1 of profile 'default'" \
     "${output}"
 }
 
@@ -137,7 +139,7 @@ test_tools_offers_volumes_of_what_is_no_longer_defined() {
   reset_clean
   kwargs[dry_run]=1
   args=(tools)
-  fake_volume_listing=$'rclone/default/1/dockered-claude-tool-default-rclone-1\nuv/gone/1/dockered-claude-tool-gone-uv-1\n///dockered-claude-tool-uv\n///unrelated-dockered-claude-tool-x\n'
+  fake_volume_listing=$'rclone/default/1/sha256:base/1/dockered-claude-tool-default-rclone-1\nuv/gone/1/sha256:base/1/dockered-claude-tool-gone-uv-1\n/////dockered-claude-tool-uv\n/////unrelated-dockered-claude-tool-x\n'
   capture clean_unused
   assert_status 0
   assert_equal \
@@ -196,7 +198,7 @@ test_all_cleans_containers_first() {
   reset_clean
   args=(all)
   fake_stopped_containers=$'c1 quirky_name dockered-claude-default:latest\n'
-  fake_volume_listing=$'uv/default/1/dockered-claude-tool-default-uv-1\nuv/default/2/dockered-claude-tool-default-uv-2\n'
+  fake_volume_listing=$'uv/default/1/sha256:base/1/dockered-claude-tool-default-uv-1\nuv/default/2/sha256:base/1/dockered-claude-tool-default-uv-2\n'
   capture clean_unused <<<$'y\ny'
   assert_status 0
   assert_file "${calls}" \
@@ -232,5 +234,30 @@ test_profiles_offers_the_generations_that_latest_does_not_mark() {
   assert_status 0
   assert_equal \
     $'image dockered-claude-default:1: generation 1 of profile \'default\', not the latest\nimage dockered-claude-default:3: generation 3 of profile \'default\', not the latest\nimage dockered-claude-gone:1: profile \'gone\' is no longer defined' \
+    "${output}"
+}
+
+test_tools_offers_volumes_of_profile_images_no_longer_there() {
+  reset_clean
+  kwargs[dry_run]=1
+  args=(tools)
+  fake_volume_listing=$'uv/default/1/sha256:gone/1/dockered-claude-tool-default-1-uv-1\nuv/default/2/sha256:base/2/dockered-claude-tool-default-2-uv-2\nuv/default/3///dockered-claude-tool-default-uv-3\n'
+  capture clean_unused
+  assert_status 0
+  assert_equal \
+    $'volume dockered-claude-tool-default-1-uv-1: built from generation 1 of profile \'default\', which no longer exists\nvolume dockered-claude-tool-default-uv-3: built before tool volumes were tied to profile images' \
+    "${output}"
+}
+
+test_tools_keeps_the_newest_of_each_profile_image() {
+  reset_clean
+  kwargs[dry_run]=1
+  args=(tools)
+  fake_image_ids=$'sha256:base\nsha256:older'
+  fake_volume_listing=$'uv/default/1/sha256:older/1/dockered-claude-tool-default-1-uv-1\nuv/default/2/sha256:older/1/dockered-claude-tool-default-1-uv-2\nuv/default/3/sha256:base/2/dockered-claude-tool-default-2-uv-3\n'
+  capture clean_unused
+  assert_status 0
+  assert_equal \
+    "volume dockered-claude-tool-default-1-uv-1: older generation of tool 'uv' for generation 1 of profile 'default'" \
     "${output}"
 }
