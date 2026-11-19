@@ -546,11 +546,11 @@ write_project_config() {
   # and renamed over the configuration,
   # so an interrupted run cannot leave half a file.
   temporary="$(mktemp -- "${directory}/.config.XXXXXX")" || return
-  printf '%s\n' "${config_lines[@]}" >"${temporary}" &&
-    mv -f -- "${temporary}" "${project_config}" || {
+  if ! printf '%s\n' "${config_lines[@]}" >"${temporary}" ||
+    ! mv -f -- "${temporary}" "${project_config}"; then
     rm -f -- "${temporary}"
     return 1
-  }
+  fi
 }
 
 # Save KEY = VALUE to project_config if VALUE differs from the current one,
