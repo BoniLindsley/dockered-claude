@@ -36,7 +36,8 @@ test_tool_list_shows_which_tools_are_built() {
   : >"${project_directory}/tools/missing/Dockerfile"
   # shellcheck disable=SC2329 # Called by list_tools.
   docker() {
-    [[ "$*" == 'volume inspect dockered-claude-tool-built' ]]
+    [[ "$*" != *'label=dockered-claude.tool=built '*'label=dockered-claude.profile=default '* ]] ||
+      printf '%s\n' '1 dockered-claude-tool-default-built-1'
   }
   parse_arguments tool list
   capture run
@@ -161,6 +162,21 @@ test_build_builds_the_saved_profile() {
   assert_status 0
   assert_file "${calls}" \
     "docker build --label dockered-claude.profile=minimal --pull --tag dockered-claude-minimal:latest ${project_directory}/profiles/minimal"
+}
+
+test_tool_build_uses_the_given_profile() {
+  reset_commands
+  mkdir -p -- "${project_directory}/profiles/minimal"
+  : >"${project_directory}/profiles/minimal/Dockerfile"
+  # shellcheck disable=SC2329 # Called by run.
+  ensure_image() { record_call "${image}"; }
+  # shellcheck disable=SC2329 # Called by run.
+  build_tool_volume() { record_call "$@"; }
+  parse_arguments tool build --profile minimal uv
+  capture run
+  assert_status 0
+  assert_file "${calls}" \
+    $'ensure_image dockered-claude-minimal:latest\nbuild_tool_volume uv refresh'
 }
 
 test_tool_build_uses_the_profile_of_the_environment() {

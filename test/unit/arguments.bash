@@ -267,3 +267,30 @@ test_profile_build_requires_a_valid_name() {
   assert_status 1
   assert_contains "${errors}" "invalid profile name '../escape'"
 }
+
+test_tool_commands_take_a_profile() {
+  reset_arguments
+  capture parse_arguments tool list --profile minimal
+  assert_status 0
+  assert_equal minimal "${kwargs[profile]}"
+
+  reset_arguments
+  capture parse_arguments tool build uv --profile minimal vcpkg
+  assert_status 0
+  assert_equal minimal "${kwargs[profile]}"
+  assert_array args uv vcpkg
+}
+
+test_tool_list_takes_no_names() {
+  reset_arguments
+  capture parse_arguments tool list uv
+  assert_status 1
+  assert_contains "${errors}" "tool list: unexpected argument 'uv'"
+}
+
+test_profile_commands_take_no_profile() {
+  reset_arguments
+  capture parse_arguments profile build --profile minimal default
+  assert_status 1
+  assert_contains "${errors}" "profile build: unexpected argument '--profile'"
+}

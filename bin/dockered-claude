@@ -10,8 +10,8 @@ Usage: ${script_name} [run] [--profile NAME]
        ${script_name} build
        ${script_name} profile list
        ${script_name} profile build NAME...
-       ${script_name} tool list
-       ${script_name} tool build NAME...
+       ${script_name} tool list [--profile NAME]
+       ${script_name} tool build [--profile NAME] NAME...
        ${script_name} --help
 
 Run Claude Code in an isolated Docker container.
@@ -28,9 +28,12 @@ Commands:
   profile list            List the profiles and whether each is built
   profile build NAME...   Build or update the image of each profile NAME
                           from profiles/NAME/Dockerfile
-  tool list               List the tools and whether each is built
+  tool list               List the tools and whether each is built for
+                          the profile of --profile, else that of
+                          DOCKERED_CLAUDE_PROFILE
   tool build NAME...      Build or update each tool NAME from
-                          tools/NAME/Dockerfile, replacing its volume
+                          tools/NAME/Dockerfile for that profile, as a new
+                          generation of its volume
 
 Options of run:
   -h, --help              Show this help (also after any command)
@@ -120,11 +123,8 @@ Mounts:
   rebuilt with build and whenever the profile's image has changed. Remove
   unused ones with:
   docker image prune --all --filter label=dockered-claude.packages
-  (they are rebuilt when next needed). Tools are built on a profile's
-  image, without the packages, since they are shared between projects:
-  on the project's profile when a run builds a missing tool, and on that
-  of DOCKERED_CLAUDE_PROFILE with tool build. Their volumes are shared
-  between profiles too.
+  (they are rebuilt when next needed). Tools are built on the profile's
+  image, without the packages, since they are shared between projects.
 
 Profiles:
   Each profile is a directory profiles/NAME next to the launcher's bin/,
@@ -160,20 +160,24 @@ Tools:
   a Dockerfile and anything it needs, so tools for one machine are kept or
   left out by adding, leaving untracked or ignoring their directory in git.
 
-  The Dockerfile builds on the base image (ARG BASE_IMAGE) and installs the
-  tool under /opt/tools/NAME, with its executables in bin/; its last stage
-  holds only that directory (FROM scratch, then COPY --from). The launcher
-  copies it into the volume dockered-claude-tool-NAME and removes the
-  image, so the volume is the only copy. A selected tool whose volume is
-  missing is built before Claude Code starts. tool build rebuilds it
+  The Dockerfile builds on a profile's image (ARG BASE_IMAGE) and installs
+  the tool under /opt/tools/NAME, with its executables in bin/; its last
+  stage holds only that directory (FROM scratch, then COPY --from). The
+  launcher copies it into a new volume and removes the image, so the
+  volume is the only copy. Each build of a tool for a profile is a new
+  generation, in the volume dockered-claude-tool-PROFILE-NAME-GENERATION,
+  labelled dockered-claude.tool, .profile and .generation, so a rebuild
+  leaves running containers alone. A selected tool without a volume for
+  the profile is built before Claude Code starts. tool build rebuilds it
   without the build cache, which updates tools that download their latest
-  release; Docker refuses to replace a volume in use, so stop containers
-  using the tool first. Remove a tool's volume with:
-  docker volume rm dockered-claude-tool-NAME
+  release.
 
-  A selected tool's volume is mounted read-only at /opt/tools/NAME and
-  /opt/tools/NAME/bin is put in front of PATH, in selection order, so the
-  first tool selected wins on name collisions.
+  A run mounts the newest generation of each selected tool read-only at
+  /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
+  selection order, so the first tool selected wins on name collisions. It
+  warns about older generations that no container uses, which can be
+  removed with docker volume rm. Volumes named dockered-claude-tool-NAME,
+  from earlier versions of the launcher, are no longer used.
 
   A tool may also have an env file in its directory, in docker's --env-file
   format, to set variables it needs (e.g. VCPKG_ROOT=/opt/tools/vcpkg/root).
@@ -345,33 +349,16 @@ parse_no_arguments() {
 # and args to the names to build,
 # for the commands GROUP list and GROUP build NAME...,
 # where GROUP names its validate_GROUP_name function.
+# The tool commands also take --profile NAME.
 parse_group_arguments() {
-  declare group="$1" argument
+  declare group="$1" command argument
   shift
   case "${1:-}" in
-  -h | --help) kwargs[help]=1 ;;
-  list)
-    kwargs[command]="${group}-list"
-    shift
-    parse_no_arguments "${group} list" "$@" || return
+  -h | --help)
+    kwargs[help]=1
+    return 0
     ;;
-  build)
-    kwargs[command]="${group}-build"
-    shift
-    for argument in "$@"; do
-      case "${argument}" in
-      -h | --help) kwargs[help]=1 ;;
-      *)
-        "validate_${group}_name" "${argument}" || return
-        args+=("${argument}")
-        ;;
-      esac
-    done
-    if ((${#args[@]} == 0)) && [[ -z "${kwargs[help]+defined}" ]]; then
-      warn "${group} build requires a ${group} name"
-      return 1
-    fi
-    ;;
+  list | build) command="$1" ;;
   '')
     warn "${group} requires list or build"
     return 1
@@ -381,6 +368,43 @@ parse_group_arguments() {
     return 1
     ;;
   esac
+  kwargs[command]="${group}-${command}"
+  shift
+
+  while (($#)); do
+    argument="$1"
+    shift
+    case "${argument}" in
+    -h | --help) kwargs[help]=1 ;;
+    --profile)
+      if [[ "${group}" != tool ]]; then
+        warn "${group} ${command}: unexpected argument '${argument}'"
+        return 1
+      fi
+      if (($# == 0)); then
+        warn "${argument} requires a profile name"
+        return 1
+      fi
+      validate_profile_name "$1" || return
+      kwargs[profile]="$1"
+      shift
+      ;;
+    *)
+      if [[ "${command}" == list ]]; then
+        warn "${group} list: unexpected argument '${argument}'"
+        return 1
+      fi
+      "validate_${group}_name" "${argument}" || return
+      args+=("${argument}")
+      ;;
+    esac
+  done
+
+  if [[ "${command}" == build ]] && ((${#args[@]} == 0)) &&
+    [[ -z "${kwargs[help]+defined}" ]]; then
+    warn "${group} build requires a ${group} name"
+    return 1
+  fi
 }
 
 resolve_paths() {
@@ -697,10 +721,33 @@ tool_defined() {
   [[ -f "${project_directory}/tools/${tool}/Dockerfile" ]]
 }
 
-# A tool is built once its volume exists.
+# Set tool_volumes to the volumes of TOOL for the profile,
+# oldest generation first,
+# and tool_generations to their generations.
+# Volumes are found by their labels,
+# since tool and profile names may hold the dashes that separate them.
+find_tool_volumes() {
+  declare tool="$1" listing generation name
+  tool_volumes=()
+  tool_generations=()
+  listing="$(docker volume ls \
+    --filter "label=dockered-claude.tool=${tool}" \
+    --filter "label=dockered-claude.profile=${profile}" \
+    --format '{{.Label "dockered-claude.generation"}} {{.Name}}')" || return
+  listing="$(sort -n <<<"${listing}")" || return
+  while read -r generation name; do
+    [[ "${generation}" =~ ^[1-9][0-9]*$ ]] || continue
+    tool_generations+=("${generation}")
+    tool_volumes+=("${name}")
+  done <<<"${listing}"
+}
+
+# A tool is built for the profile once it has a volume.
 tool_built() {
   declare tool="$1"
-  docker volume inspect "dockered-claude-tool-${tool}" >/dev/null 2>&1
+  declare -a tool_volumes tool_generations
+  find_tool_volumes "${tool}" || return
+  ((${#tool_volumes[@]} > 0))
 }
 
 check_tool_defined() {
@@ -711,16 +758,49 @@ check_tool_defined() {
   return 1
 }
 
-# Build each selected tool whose volume is missing.
+# Set tool_volume_names, by tool, to the newest volume
+# of each selected tool for the profile,
+# building those that have none.
 # A volume left from a tool whose directory was removed is not used.
-build_missing_tools() {
+find_tool_volume_names() {
   declare tool
+  declare -a tool_volumes tool_generations
   for tool in "${tools[@]}"; do
+    [[ -z "${tool_volume_names[${tool}]+defined}" ]] || continue
     check_tool_defined "${tool}" || return
-    tool_built "${tool}" && continue
-    warn "building tool '${tool}'"
-    build_tool_volume "${tool}" || return
+    find_tool_volumes "${tool}" || return
+    if ((${#tool_volumes[@]} == 0)); then
+      warn "building tool '${tool}' for profile '${profile}'"
+      build_tool_volume "${tool}" || return
+      find_tool_volumes "${tool}" || return
+      if ((${#tool_volumes[@]} == 0)); then
+        warn "no volume of tool '${tool}' after building it"
+        return 1
+      fi
+    fi
+    tool_volume_names[${tool}]="${tool_volumes[-1]}"
   done
+}
+
+# Warn about older volumes of the selected tools that no container uses.
+warn_unused_tool_volumes() {
+  declare tool volume containers
+  declare -a tool_volumes tool_generations unused=()
+  declare -A seen=()
+  for tool in "${tools[@]}"; do
+    [[ -z "${seen[${tool}]+defined}" ]] || continue
+    seen[${tool}]=1
+    find_tool_volumes "${tool}" || return
+    ((${#tool_volumes[@]} > 1)) || continue
+    for volume in "${tool_volumes[@]:0:${#tool_volumes[@]}-1}"; do
+      containers="$(docker ps --all --quiet --filter "volume=${volume}")" ||
+        return
+      [[ -n "${containers}" ]] || unused+=("${volume}")
+    done
+  done
+  ((${#unused[@]} > 0)) || return 0
+  warn "older tool volumes that no container uses:" "${unused[*]};" \
+    "remove them with: docker volume rm ${unused[*]}"
 }
 
 declare project_config_path='.meta/dockered-claude/config'
@@ -1205,7 +1285,8 @@ add_base_arguments() {
   fi
 }
 
-# Mount each selected tool's volume read-only at /opt/tools/<name>
+# Mount each selected tool's volume in tool_volume_names
+# read-only at /opt/tools/<name>
 # and add its bin/ to path_entries, in selection order.
 # A tool's env file, if any, is passed with --env-file.
 # Later files override earlier ones,
@@ -1229,7 +1310,7 @@ add_tool_arguments() {
       env_args=(--env-file "${env_file}" "${env_args[@]}")
     fi
     docker_args+=(
-      --mount "type=volume,src=dockered-claude-tool-${tool},dst=/opt/tools/${tool},readonly"
+      --mount "type=volume,src=${tool_volume_names[${tool}]},dst=/opt/tools/${tool},readonly"
     )
   done
 
@@ -1261,34 +1342,25 @@ add_path_argument() {
   docker_args+=(--env "PATH=${entries}:${image_path}")
 }
 
-# Build tools/TOOL/Dockerfile on the base image
+# Build tools/TOOL/Dockerfile on the profile's image
 # and copy the prefix it holds, /opt/tools/TOOL,
-# into the volume dockered-claude-tool-TOOL, replacing that volume.
+# into a new volume, the next generation of the tool for the profile.
 # The image is untagged and removed afterwards,
 # so the volume is the only copy of the tool.
 # With REFRESH, the build cache is not used,
 # so that downloads of the latest release are repeated;
 # otherwise a rebuild would reuse the cached layers and update nothing.
-# Docker copies an image's files into an empty volume
-# when a container that mounts it is created,
-# so the fill container is created but never started.
-# Its fixed name makes Docker refuse a second fill of the same tool
-# while one is in progress.
 build_tool_volume() {
   declare tool="$1" refresh="${2:-}"
   declare directory="${project_directory}/tools/${tool}"
-  declare volume="dockered-claude-tool-${tool}"
   declare prefix="/opt/tools/${tool}"
-  declare temporary_directory tool_image
+  declare temporary_directory tool_image generation volume
+  declare -a tool_volumes tool_generations
 
   if [[ ! -f "${directory}/Dockerfile" ]]; then
     warn "no tool '${tool}': ${directory}/Dockerfile is missing"
     return 1
   fi
-  # Checked before building, so that a refused rebuild
-  # neither spends the build nor leaves its image behind.
-  # fill_tool_volume still handles a container started meanwhile.
-  check_tool_not_in_use || return
 
   temporary_directory="$(mktemp -d)" || return
   if ! docker build \
@@ -1302,40 +1374,44 @@ build_tool_volume() {
   tool_image="$(<"${temporary_directory}/image-id")" || return
   rm -rf -- "${temporary_directory}" || return
 
-  fill_tool_volume || {
-    docker image rm "${tool_image}" >/dev/null
-    return 1
-  }
-  docker image rm "${tool_image}" >/dev/null || return
-}
-
-# Fail when a container, running or stopped, uses the volume,
-# since Docker refuses to remove it then.
-# Reads tool and volume from build_tool_volume.
-check_tool_not_in_use() {
-  declare containers
-  containers="$(docker ps --all --quiet --filter "volume=${volume}")" || return
-  [[ -n "${containers}" ]] || return 0
-  warn "cannot rebuild tool '${tool}' while a container uses it;" \
-    "stop or remove those containers and try again:" "${containers//$'\n'/ }"
+  # The generation is chosen after the build,
+  # so that a build finishing meanwhile is counted.
+  if find_tool_volumes "${tool}"; then
+    generation=1
+    ((${#tool_generations[@]} == 0)) ||
+      generation=$((tool_generations[-1] + 1))
+    volume="dockered-claude-tool-${profile}-${tool}-${generation}"
+    if fill_tool_volume; then
+      docker image rm "${tool_image}" >/dev/null || return
+      warn "built tool '${tool}' for profile '${profile}' in ${volume}"
+      return 0
+    fi
+  fi
+  docker image rm "${tool_image}" >/dev/null
   return 1
 }
 
-# Replace the volume with the files of tool_image at prefix.
-# Reads tool, volume, prefix and tool_image from build_tool_volume.
+# Create volume with the files of tool_image at prefix, and its labels.
+# Docker copies an image's files into a new volume
+# when a container that mounts it is created,
+# so the fill container is created but never started.
+# Its name makes Docker refuse a second fill of the same volume
+# while one is in progress,
+# and the build label, which Docker sets only on a volume it creates,
+# shows whether this fill created the volume
+# or found one made by another build.
+# Reads tool, profile, generation, volume, prefix and tool_image
+# from build_tool_volume.
 fill_tool_volume() {
-  declare filler="${volume}-fill"
-  if docker volume inspect "${volume}" >/dev/null 2>&1 &&
-    ! docker volume rm "${volume}" >/dev/null; then
-    warn "cannot rebuild tool '${tool}' while a container uses it;" \
-      "stop those containers and try again"
-    return 1
-  fi
-  docker volume create --label "dockered-claude.tool=${tool}" "${volume}" \
-    >/dev/null || return
-  if ! docker create \
-    --mount "type=volume,src=${volume},dst=${prefix}" \
-    --name "${filler}" \
+  declare filler="${volume}-fill" build created_by label
+  declare mount="type=volume,src=${volume},dst=${prefix}"
+  build="$$-${RANDOM}-${RANDOM}"
+  for label in "tool=${tool}" "profile=${profile}" \
+    "generation=${generation}" "build=${build}"; do
+    mount+=",volume-label=dockered-claude.${label}"
+  done
+
+  if ! docker create --mount "${mount}" --name "${filler}" \
     "${tool_image}" /none >/dev/null; then
     warn "cannot fill the volume of tool '${tool}';" \
       "if no other build of it is running, remove the leftover container:" \
@@ -1343,6 +1419,14 @@ fill_tool_volume() {
     return 1
   fi
   docker rm "${filler}" >/dev/null || return
+  created_by="$(docker volume inspect \
+    --format '{{index .Labels "dockered-claude.build"}}' "${volume}")" ||
+    return
+  if [[ "${created_by}" != "${build}" ]]; then
+    warn "${volume} existed already, probably from another build" \
+      "of tool '${tool}' at the same time; build it again"
+    return 1
+  fi
 }
 
 run_container() {
@@ -1438,6 +1522,7 @@ run() {
   declare -a project_mounts=() mount_paths=()
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
+  declare -A tool_volume_names=()
 
   declare name
 
@@ -1460,6 +1545,7 @@ run() {
     return
     ;;
   tool-list)
+    select_profile || return
     list_tools
     return
     ;;
@@ -1487,7 +1573,8 @@ run() {
   link_agent_skills || return
   link_config_files || return
   ensure_image || return
-  build_missing_tools || return
+  find_tool_volume_names || return
+  warn_unused_tool_volumes || return
   ensure_packages_image || return
   save_project_options || return
   run_container "${args[@]}" || return

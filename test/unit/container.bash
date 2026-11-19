@@ -15,6 +15,10 @@ source -- "${launcher}" || return
 reset_container() {
   set_launcher_paths
   declare -ga tools=() docker_args=() path_entries=()
+  declare -gA tool_volume_names=(
+    [uv]=dockered-claude-tool-default-uv-2
+    [rclone]=dockered-claude-tool-default-rclone-1
+  )
   project_directory="${temporary_directory}/launcher"
   container_image=dockered-claude-default:latest
   mkdir -p -- "${project_directory}"/tools/{rclone,uv}
@@ -36,8 +40,8 @@ test_tools_go_in_front_of_the_image_path_in_order() {
   capture add_path_argument
   assert_status 0
   assert_array docker_args \
-    --mount type=volume,src=dockered-claude-tool-uv,dst=/opt/tools/uv,readonly \
-    --mount type=volume,src=dockered-claude-tool-rclone,dst=/opt/tools/rclone,readonly \
+    --mount type=volume,src=dockered-claude-tool-default-uv-2,dst=/opt/tools/uv,readonly \
+    --mount type=volume,src=dockered-claude-tool-default-rclone-1,dst=/opt/tools/rclone,readonly \
     --env-file "${project_directory}/tools/uv/env" \
     --env PATH=/opt/tools/uv/bin:/opt/tools/rclone/bin:/usr/local/bin:/usr/bin
 }
@@ -60,7 +64,7 @@ test_profile_variables_are_passed_and_its_path_follows_the_tools() {
   capture add_path_argument
   assert_status 0
   assert_array docker_args \
-    --mount type=volume,src=dockered-claude-tool-uv,dst=/opt/tools/uv,readonly \
+    --mount type=volume,src=dockered-claude-tool-default-uv-2,dst=/opt/tools/uv,readonly \
     --env-file "${project_directory}/tools/uv/env" \
     --env SDK_HOME \
     --env PATH=/opt/tools/uv/bin:/opt/sdk/bin:/usr/local/bin:/usr/bin
