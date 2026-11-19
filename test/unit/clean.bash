@@ -220,3 +220,16 @@ test_the_command_runs_clean() {
   assert_status 0
   assert_file "${calls}" 'clean_unused tools'
 }
+
+test_profiles_offers_the_generations_that_latest_does_not_mark() {
+  reset_clean
+  kwargs[dry_run]=1
+  args=(profiles)
+  fake_profile_listing=$'sha256:g1 dockered-claude-default:1\nsha256:g2 dockered-claude-default:2\nsha256:g2 dockered-claude-default:latest\nsha256:g3 dockered-claude-default:3\nsha256:g4 dockered-claude-default:4\nsha256:x1 dockered-claude-gone:1\n'
+  fake_users_of["ancestor=sha256:g4"]=container
+  capture clean_unused
+  assert_status 0
+  assert_equal \
+    $'image dockered-claude-default:1: generation 1 of profile \'default\', not the latest\nimage dockered-claude-default:3: generation 3 of profile \'default\', not the latest\nimage dockered-claude-gone:1: profile \'gone\' is no longer defined' \
+    "${output}"
+}

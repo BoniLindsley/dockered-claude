@@ -25,9 +25,10 @@ Commands:
                           so a prompt is given as: run 'PROMPT'
   build                   Rebuild the image of the project's profile, and
                           the packages image of the project's packages
-  profile list            List the profiles and whether each is built
+  profile list            List the profiles and the generations of their
+                          images, marking the latest
   profile build NAME...   Build or update the image of each profile NAME
-                          from profiles/NAME/Dockerfile
+                          from profiles/NAME/Dockerfile, as a generation
   tool list               List the tools and whether each is built for
                           the profile of --profile, else that of
                           DOCKERED_CLAUDE_PROFILE
@@ -42,9 +43,10 @@ Commands:
                                       longer defined
                           packages    packages images (rebuilt when next
                                       needed)
-                          profiles    profile images replaced by a later
-                                      build, or of a profile no longer
-                                      defined
+                          profiles    generations of profile images that
+                                      latest does not mark, images left
+                                      untagged, and those of a profile no
+                                      longer defined
                           all         all of the above
                           Nothing a container uses, running or not, is
                           offered; images and volumes of earlier versions
@@ -159,6 +161,15 @@ Profiles:
   The image must provide what Claude Code and the tools need, as
   profiles/default does. A selected profile whose image is missing is
   built before Claude Code starts.
+
+  Each build is also tagged with its generation, dockered-claude-NAME:1,
+  :2 and so on, and latest is moved to it; runs use the image that latest
+  marks. A build that gives the image of an existing generation, as one
+  taken wholly from the build cache does, adds none and marks that one
+  latest. To go back to an earlier generation, mark it latest:
+  docker tag dockered-claude-NAME:GENERATION dockered-claude-NAME:latest
+  An image built by an earlier version of the launcher is tagged as a
+  generation when the launcher next uses or rebuilds it.
 
   A profile may also hold launcher.bash, which is sourced before each run
   in a child bash with set -euo pipefail, in the working directory and
@@ -1142,17 +1153,35 @@ list_tools() {
   done
 }
 
+# Print each profile, with its generations, newest first,
+# marking the one that latest marks,
+# or with "(not built)".
 list_profiles() {
-  declare entry profile image container_image
+  declare entry profile image container_image latest_id generation
+  declare -i index
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
   for entry in "${project_directory}"/profiles/*/Dockerfile; do
     [[ -f "${entry}" ]] || continue
     entry="${entry%/Dockerfile}"
     set_profile "${entry##*/}"
-    if image_exists; then
-      printf '%s\n' "${profile}"
-    else
+    find_profile_generations || return
+    if [[ -z "${latest_id}" ]] && ((${#profile_generations[@]} == 0)); then
       printf '%s (not built)\n' "${profile}"
+      continue
     fi
+    printf '%s\n' "${profile}"
+    find_generation_of "${latest_id}"
+    if [[ -n "${latest_id}" && -z "${generation}" ]]; then
+      printf '  latest, from an earlier version of the launcher\n'
+    fi
+    for ((index = ${#profile_generations[@]} - 1; index >= 0; index--)); do
+      generation="${profile_generations[index]}"
+      printf '  %s, built %s' "${generation}" "${generation_ages[${generation}]}"
+      [[ "${generation_ids[${generation}]}" != "${latest_id}" ]] ||
+        printf ' (latest)'
+      printf '\n'
+    done
   done
 }
 
@@ -1311,21 +1340,131 @@ link_config_files() {
   done
 }
 
-image_exists() {
-  docker image inspect "${image}" >/dev/null 2>&1
+# Set profile_generations to the generations of the profile's image,
+# oldest first,
+# generation_ids and generation_ages to their image IDs and ages,
+# by generation,
+# and latest_id to the ID that the latest tag marks, or to nothing.
+# Generations are the tags of the profile's repository that are numbers.
+find_profile_generations() {
+  declare repository="${image%:*}" listing tag id age
+  profile_generations=()
+  generation_ids=()
+  generation_ages=()
+  latest_id=''
+  listing="$(docker image ls --no-trunc \
+    --format '{{.Tag}} {{.ID}} {{.CreatedSince}}' "${repository}")" || return
+  listing="$(sort -n <<<"${listing}")" || return
+  while read -r tag id age; do
+    if [[ "${tag}" == latest ]]; then
+      latest_id="${id}"
+    elif [[ "${tag}" =~ ^[1-9][0-9]*$ ]]; then
+      profile_generations+=("${tag}")
+      generation_ids[${tag}]="${id}"
+      generation_ages[${tag}]="${age}"
+    fi
+  done <<<"${listing}"
 }
 
-# Build the image of profile from its directory.
+# Set generation to the generation of the profile whose image ID is ID,
+# or to nothing.
+# Reads profile_generations and generation_ids.
+find_generation_of() {
+  declare id="$1" candidate
+  generation=''
+  for candidate in "${profile_generations[@]}"; do
+    [[ "${generation_ids[${candidate}]}" != "${id}" ]] || generation="${candidate}"
+  done
+}
+
+# Tag image ID as a generation of the profile,
+# reusing the generation that has that ID already,
+# else the newest generation plus one,
+# and set generation to it.
+# Reads and updates profile_generations and generation_ids.
+tag_generation() {
+  declare id="$1"
+  find_generation_of "${id}"
+  [[ -z "${generation}" ]] || return 0
+  generation=1
+  ((${#profile_generations[@]} == 0)) ||
+    generation=$((profile_generations[-1] + 1))
+  docker tag "${id}" "${image%:*}:${generation}" || return
+  profile_generations+=("${generation}")
+  generation_ids[${generation}]="${id}"
+}
+
+# Tag the image that latest_id marks as a generation of the profile
+# when it is none,
+# as an image built by an earlier version of the launcher,
+# so that a later build does not leave it untagged.
+adopt_latest_image() {
+  [[ -n "${latest_id}" ]] || return 0
+  declare generation
+  find_generation_of "${latest_id}"
+  [[ -z "${generation}" ]] || return 0
+  tag_generation "${latest_id}" || return
+  warn "tagged the image of profile '${profile}' as generation ${generation}"
+}
+
+# Build the image of profile from its directory
+# as a generation, as tag_generation chooses it, and mark it latest.
+# A build whose steps all come from the cache gives an image ID
+# that a generation has already, which is then marked latest again.
 build_image() {
-  docker build \
+  declare id_file id generation latest_id
+  declare -i known
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
+  find_profile_generations || return
+  adopt_latest_image || return
+  known=${#profile_generations[@]}
+
+  id_file="$(mktemp)" || return
+  if ! docker build \
+    --iidfile "${id_file}" \
     --label "dockered-claude.profile=${profile}" \
     --pull \
-    --tag "${image}" \
-    "${project_directory}/profiles/${profile}" || return
+    "${project_directory}/profiles/${profile}"; then
+    rm -f -- "${id_file}"
+    return 1
+  fi
+  id="$(<"${id_file}")"
+  rm -f -- "${id_file}" || return
+  if [[ -z "${id}" ]]; then
+    warn "the build of profile '${profile}' gave no image ID"
+    return 1
+  fi
+
+  tag_generation "${id}" || return
+  docker tag "${id}" "${image}" || return
+  if ((${#profile_generations[@]} > known)); then
+    warn "built generation ${generation} of profile '${profile}'"
+  else
+    warn "the build of profile '${profile}' is generation ${generation}," \
+      "built already; marked it latest"
+  fi
 }
 
+# Build the profile's image if it has none,
+# adopting one from an earlier version of the launcher as a generation.
+# Generations without a latest tag are not used:
+# which one to mark is the user's choice.
 ensure_image() {
-  image_exists || build_image || return
+  declare latest_id
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
+  find_profile_generations || return
+  if [[ -n "${latest_id}" ]]; then
+    adopt_latest_image
+    return
+  fi
+  if ((${#profile_generations[@]} > 0)); then
+    warn "no generation of profile '${profile}' is marked latest;" \
+      "mark one with: docker tag ${image%:*}:GENERATION ${image}"
+    return 1
+  fi
+  build_image
 }
 
 # Run containers from an image with the selected packages
@@ -1939,14 +2078,16 @@ find_unused_packages() {
   done <<<"${listing}"
 }
 
-# Add the images of profiles that no container uses, running or not,
-# which a later build replaced or whose profile is no longer defined,
+# Add the images of profiles that no container uses, running or not:
+# generations that latest does not mark,
+# images that a later build left untagged,
+# all images of a profile no longer defined,
 # and images named dockered-claude, from earlier versions of the launcher.
 # Packages images carry their profile's label too, so they are left out.
 find_unused_profiles() {
   declare packages_ids listing old_listing id reference repository reason
-  declare users
-  declare -A seen=()
+  declare users tag name
+  declare -A seen=() latest_ids=()
   packages_ids="$(docker image ls --quiet --no-trunc \
     --filter label=dockered-claude.packages)" || return
   listing="$(docker image ls --no-trunc \
@@ -1956,18 +2097,29 @@ find_unused_profiles() {
     --format '{{.ID}} {{.Repository}}:{{.Tag}}' dockered-claude)" || return
 
   while read -r id reference; do
+    [[ "${reference}" == *:latest ]] || continue
+    latest_ids[${reference%:*}]="${id}"
+  done <<<"${listing}"
+
+  while read -r id reference; do
     [[ -n "${id}" && -z "${seen[${reference}]+defined}" ]] || continue
     seen[${reference}]=1
     [[ $'\n'"${packages_ids}"$'\n' != *$'\n'"${id}"$'\n'* ]] || continue
     repository="${reference%:*}"
+    tag="${reference##*:}"
+    name="${repository#dockered-claude-}"
     if [[ "${reference}" == '<none>:<none>' ]]; then
       reference="${id}"
       reason='replaced by a later build'
     elif [[ "${repository}" == dockered-claude ]]; then
       reason='from an earlier version of the launcher'
     elif [[ "${repository}" == dockered-claude-?* ]] &&
-      ! profile_defined "${repository#dockered-claude-}"; then
-      reason="profile '${repository#dockered-claude-}' is no longer defined"
+      ! profile_defined "${name}"; then
+      reason="profile '${name}' is no longer defined"
+    elif [[ "${repository}" == dockered-claude-?* &&
+      "${tag}" =~ ^[1-9][0-9]*$ &&
+      "${id}" != "${latest_ids[${repository}]:-}" ]]; then
+      reason="generation ${tag} of profile '${name}', not the latest"
     else
       continue
     fi
