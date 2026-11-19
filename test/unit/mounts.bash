@@ -301,3 +301,31 @@ test_selecting_given_mounts_ignores_saved_ones() {
   assert_array mount_paths "${temporary_directory}/given"
   assert_equal rw "${mount_modes["${temporary_directory}/given"]}"
 }
+
+test_links_inside_mounts_are_not_made() {
+  reset_mounts
+  mount_paths=(/srv/data)
+  link_paths=(/srv/data/current /home/someone/project/lib /srv/other /1/2)
+  capture select_run_links
+  assert_status 0
+  assert_equal '' "${errors}"
+  assert_array run_links /srv/other /1/2
+}
+
+test_links_at_inside_or_above_reserved_paths_are_refused() {
+  reset_mounts
+  link_paths=(
+    /opt /usr/lib64 /home /home/someone /home/someone/.config
+    /home/someone/.claude/projects /home/someone/src /srv/data
+  )
+  capture select_run_links
+  assert_status 0
+  assert_array run_links /home/someone/src /srv/data
+  assert_equal "${script_name}: not making the symbolic link '/opt' in the container: it is at, inside or above /opt/tools
+${script_name}: not making the symbolic link '/usr/lib64' in the container: it is at, inside or above /usr
+${script_name}: not making the symbolic link '/home' in the container: it is at, inside or above /home/someone/.claude
+${script_name}: not making the symbolic link '/home/someone' in the container: it is at, inside or above /home/someone/.claude
+${script_name}: not making the symbolic link '/home/someone/.config' in the container: it is at, inside or above /home/someone/.config/claude
+${script_name}: not making the symbolic link '/home/someone/.claude/projects' in the container: it is at, inside or above /home/someone/.claude" \
+    "${errors}"
+}

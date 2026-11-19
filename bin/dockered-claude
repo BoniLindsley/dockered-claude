@@ -870,6 +870,37 @@ warn_missing_climbed_directories() {
   done
 }
 
+# Set run_links to the links of link_paths that the run image makes:
+# not those inside a mount, the working directory included,
+# where the host's own link is visible already,
+# nor, with a warning, those at, inside or above a reserved path
+# or at or above the home,
+# which would replace or hide what the image or the launcher puts there;
+# the mount still goes ahead at the resolved path.
+select_run_links() {
+  declare link path reserved
+  declare -a hidden_paths mounted_paths
+  set_reserved_paths
+  run_links=()
+  for link in "${link_paths[@]}"; do
+    for path in "${workdir}" "${mount_paths[@]}"; do
+      [[ "${link}" != "${path%/}/"* ]] || continue 2
+    done
+    for reserved in "${hidden_paths[@]}" "${mounted_paths[@]}" "${home}"; do
+      if [[ "${link}" == "${reserved}" || "${link}" == "${reserved}/"* ||
+        "${reserved}" == "${link}/"* ]]; then
+        if [[ "${reserved}" == "${home}" && "${link}" == "${home}/"* ]]; then
+          continue
+        fi
+        warn "not making the symbolic link '${link}' in the container:" \
+          "it is at, inside or above ${reserved}"
+        continue 2
+      fi
+    done
+    run_links+=("${link}")
+  done
+}
+
 # Set hidden_paths to the paths that the image needs
 # or that hold Claude Code's state in the persisted home,
 # and mounted_paths to those the launcher mounts itself.
@@ -2166,23 +2197,52 @@ fill_tool_volume() {
 
 # Write in DIRECTORY/root the files of the run image,
 # and DIRECTORY/context/run.tar with them:
-# /etc/passwd and /etc/group, owned by root,
-# and the home, owned by the user, 0700.
+# /etc/passwd and /etc/group, owned by root;
+# the home, owned by the user, 0700,
+# and the directories between it and each link under it,
+# owned by the user, 0755, so that Docker does not make them as root;
+# and the links of run_links, with their targets from link_targets,
+# owned by root.
 # The tar has no entries for the directories above them,
 # so the base image's own keep their owner and mode,
 # and Docker creates missing ones as root, 0755.
+# The directories come before the links inside them.
 write_run_archive() {
   declare directory="$1"
   declare root="${directory}/root" archive="${directory}/context/run.tar"
+  declare link path
+  declare -a links=() home_directories=()
+  declare -A seen=()
   write_user_identity "${root}" || return
   mkdir -p -- "${root}${home}" "${archive%/*}" || return
   chmod 700 -- "${root}${home}" || return
+  for link in "${run_links[@]}"; do
+    mkdir -p -- "${root}${link%/*}" || return
+    ln -s -- "${link_targets["${link}"]}" "${root}${link}" || return
+    links+=("${link#/}")
+    path="${link%/*}"
+    while [[ "${path}" == "${home}/"* && -z "${seen["${path}"]+defined}" ]]; do
+      seen["${path}"]=1
+      chmod 755 -- "${root}${path}" || return
+      home_directories+=("${path#/}")
+      path="${path%/*}"
+    done
+  done
+  if ((${#home_directories[@]} > 0)); then
+    mapfile -t home_directories < <(printf '%s\n' "${home_directories[@]}" | sort) ||
+      return
+  fi
+
   tar --create --file "${archive}" --directory "${root}" \
     --owner=0 --group=0 --numeric-owner \
     etc/passwd etc/group || return
   tar --append --file "${archive}" --directory "${root}" \
     --owner="${uid_host}" --group="${gid_host}" --numeric-owner \
-    --no-recursion "${home#/}" || return
+    --no-recursion "${home#/}" "${home_directories[@]}" || return
+  ((${#links[@]} > 0)) || return 0
+  tar --append --file "${archive}" --directory "${root}" \
+    --owner=0 --group=0 --numeric-owner \
+    --no-recursion "${links[@]}" || return
 }
 
 # Build the run image of this run from container_image,
@@ -2645,7 +2705,7 @@ run() {
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
   declare -A tool_volume_names=() tool_pins=()
-  declare -a mounted_tools=() link_paths=()
+  declare -a mounted_tools=() link_paths=() run_links=()
   declare -A link_targets=() link_climbs=() mount_given_paths=()
 
   declare name
@@ -2711,6 +2771,7 @@ run() {
   select_mounts || return
   read_profile_launcher || return
   warn_missing_climbed_directories
+  select_run_links
   prepare_mount_points || return
   link_agent_skills || return
   link_config_files || return

@@ -129,6 +129,8 @@ reset_managed_settings() {
   agents_dir="${HOME}/.agents"
   config_dir="${HOME}/.config/claude"
   git_config_dir="${HOME}/.config/git"
+  declare -ga run_links=()
+  declare -gA link_targets=()
   username=claude
   groupname=staff
   uid_host=1000
@@ -187,7 +189,7 @@ build)
   done
   { cat -- "${context}/Dockerfile" &&
     tar --list --verbose --numeric-owner --file "${context}/run.tar" |
-    awk '{ print $1, $2, $6 }'; } >"${build}"
+    awk '{ $3 = $4 = $5 = ""; print }' | tr -s ' '; } >"${build}"
   [[ -z "${FAKE_BUILD_SIGNAL:-}" ]] || kill -s "${FAKE_BUILD_SIGNAL}" "${PPID}"
   [[ -z "${FAKE_BUILD_STATUS:-}" ]] || exit "${FAKE_BUILD_STATUS}"
   printf 'sha256:run' >"${id_file}"
@@ -304,4 +306,20 @@ test_an_interrupt_during_the_build_removes_the_image_without_running() {
   assert_status 130
   assert_equal '' "${output}"
   assert_contains "$(read_calls)" 'docker image rm sha256:run'
+}
+
+test_the_run_image_adds_the_links_after_the_home_directories() {
+  reset_managed_settings
+  run_links=("${home}/src" /1/2 "${home}/a/b/c")
+  link_targets=(["${home}/src"]=/data/src ["/1/2"]=/b ["${home}/a/b/c"]=../../x)
+  capture_run_container
+  assert_status 0
+  assert_equal "-rw-r--r-- 0/0 etc/passwd
+-rw-r--r-- 0/0 etc/group
+drwx------ 1000/1001 ${home#/}/
+drwxr-xr-x 1000/1001 ${home#/}/a/
+drwxr-xr-x 1000/1001 ${home#/}/a/b/
+lrwxrwxrwx 0/0 ${home#/}/src -> /data/src
+lrwxrwxrwx 0/0 1/2 -> /b
+lrwxrwxrwx 0/0 ${home#/}/a/b/c -> ../../x" "$(sed 1,3d -- "${build}")"
 }
