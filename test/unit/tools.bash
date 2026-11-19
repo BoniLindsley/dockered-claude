@@ -47,7 +47,8 @@ volume_label() {
 
 # A fake docker for the commands the tool functions use,
 # recording builds, creations and removals in calls.
-# The built tool image gives the version in image_version, if set.
+# The built tool image gives the version in image_version, if set,
+# and a tool's latest-version prints latest_output, failing when unset.
 docker() {
   declare argument name tool='' profile='' version='' quiet='' spec labels
   case "$1 $2" in
@@ -74,6 +75,11 @@ docker() {
     done
     ;;
   'create sha256:tool') printf 'reader\n' ;;
+  'run --cap-drop')
+    printf 'run %s\n' "$(cat)" >>"${calls}"
+    [[ -n "${latest_output+defined}" ]] || return 1
+    printf '%s\n' "${latest_output}"
+    ;;
   'cp reader:'*)
     [[ -n "${image_version:-}" ]] || return 1
     mkdir -p -- "${temporary_directory}/image"
@@ -246,4 +252,48 @@ test_building_refuses_an_invalid_version() {
   assert_status 1
   assert_contains "${errors}" "invalid version of tool 'uv': '1.0 beta'"
   assert_contains "$(<"${calls}")" 'image rm sha256:tool'
+}
+
+test_building_skips_a_latest_version_built_already() {
+  reset_tools
+  add_volume dockered-claude-tool-default-uv-2.1.328 uv default 1
+  printf '%s\n' version=2.1.328 >>"${volumes}/dockered-claude-tool-default-uv-2.1.328"
+  printf '%s\n' 'echo 2.1.328' >"${project_directory}/tools/uv/latest-version"
+  latest_output=2.1.328
+  capture build_tool_volume uv refresh
+  assert_status 0
+  assert_contains "${errors}" \
+    "tool 'uv' 2.1.328 for profile 'default' is built already"
+  assert_file "${calls}" 'run echo 2.1.328'
+}
+
+test_building_goes_ahead_for_a_new_latest_version() {
+  reset_tools
+  add_volume dockered-claude-tool-default-uv-2.1.328 uv default 1
+  printf '%s\n' version=2.1.328 >>"${volumes}/dockered-claude-tool-default-uv-2.1.328"
+  : >"${project_directory}/tools/uv/latest-version"
+  latest_output=2.1.329
+  image_version=2.1.329
+  capture build_tool_volume uv refresh
+  assert_status 0
+  assert_contains "$(<"${calls}")" 'create dockered-claude-tool-default-uv-2.1.329'
+}
+
+test_building_goes_ahead_when_latest_version_fails() {
+  reset_tools
+  : >"${project_directory}/tools/uv/latest-version"
+  capture build_tool_volume uv
+  assert_status 0
+  assert_contains "${errors}" "cannot tell the latest version of tool 'uv'; building it"
+  assert_contains "$(<"${calls}")" 'create dockered-claude-tool-default-uv-1'
+}
+
+test_building_goes_ahead_when_latest_version_is_invalid() {
+  reset_tools
+  : >"${project_directory}/tools/uv/latest-version"
+  latest_output='<html>'
+  capture build_tool_volume uv
+  assert_status 0
+  assert_contains "${errors}" "invalid latest version of tool 'uv': '<html>'"
+  assert_contains "$(<"${calls}")" 'create dockered-claude-tool-default-uv-1'
 }

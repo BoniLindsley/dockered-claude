@@ -5,6 +5,7 @@
 # but without running install.sh or `claude install`.
 # The musl build is chosen on a musl-based profile.
 # The version goes in version, so the launcher names the volume by it.
+# latest-version prints the version this would install, from the same channel.
 # The last stage holds only the tool's prefix,
 # which the launcher copies into the tool's volume.
 ARG BASE_IMAGE=dockered-claude-default:latest

@@ -175,7 +175,10 @@ Tools:
   A tool that writes its version to /opt/tools/NAME/version gets the
   volume dockered-claude-tool-PROFILE-NAME-VERSION instead, labelled
   dockered-claude.version too, and a version built already is kept rather
-  than built again.
+  than built again. A tool may also hold latest-version, a sh script
+  printing the version a build would install, which tool build runs in a
+  container of the profile's image first, skipping the build when that
+  version is built already.
 
   A run mounts the newest generation of each selected tool read-only at
   /opt/tools/NAME and puts /opt/tools/NAME/bin in front of PATH, in
@@ -1400,12 +1403,21 @@ build_tool_volume() {
   declare directory="${project_directory}/tools/${tool}"
   declare prefix="/opt/tools/${tool}"
   declare temporary_directory tool_image generation volume tool_version
-  declare existing
+  declare latest_version existing
   declare -a tool_volumes tool_generations
 
   if [[ ! -f "${directory}/Dockerfile" ]]; then
     warn "no tool '${tool}': ${directory}/Dockerfile is missing"
     return 1
+  fi
+
+  read_latest_tool_version || return
+  if [[ -n "${latest_version}" ]] &&
+    existing="$(find_version_volumes "${tool}" "${latest_version}")" &&
+    [[ -n "${existing}" ]]; then
+    warn "tool '${tool}' ${latest_version} for profile '${profile}'" \
+      "is built already in ${existing//$'\n'/ }"
+    return 0
   fi
 
   temporary_directory="$(mktemp -d)" || return
@@ -1445,6 +1457,36 @@ build_tool_volume() {
   fi
   docker image rm "${tool_image}" >/dev/null
   return 1
+}
+
+# Set latest_version to the version that tools/TOOL/latest-version prints,
+# the one a build would install,
+# run with sh in a throwaway container of the profile's image,
+# so that it needs nothing on the host;
+# or to nothing when the tool has no such script.
+# A failing script or an invalid version only costs the time it would save,
+# so the build goes ahead with a warning.
+# Reads tool, directory and image from build_tool_volume.
+read_latest_tool_version() {
+  declare script="${directory}/latest-version" output
+  latest_version=''
+  [[ -f "${script}" ]] || return 0
+  if ! output="$(docker run \
+    --cap-drop ALL \
+    --entrypoint /bin/sh \
+    --interactive \
+    --read-only \
+    --rm \
+    --tmpfs /tmp \
+    "${image}" -s <"${script}")"; then
+    warn "cannot tell the latest version of tool '${tool}'; building it"
+    return 0
+  fi
+  if [[ ! "${output}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    warn "invalid latest version of tool '${tool}': '${output}'; building it"
+    return 0
+  fi
+  latest_version="${output}"
 }
 
 # Set tool_version to the version in the file version
