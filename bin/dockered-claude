@@ -2436,9 +2436,12 @@ write_run_archive() {
       path="${path%/*}"
     done
   done
+  # Sorted bytewise, so that each directory comes before those inside it
+  # and the order does not depend on the locale.
   if ((${#home_directories[@]} > 0)); then
-    mapfile -t home_directories < <(printf '%s\n' "${home_directories[@]}" | sort) ||
-      return
+    mapfile -t home_directories < <(
+      printf '%s\n' "${home_directories[@]}" | LC_ALL=C sort
+    ) || return
   fi
 
   tar --create --file "${archive}" --directory "${root}" \
