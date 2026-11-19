@@ -3,7 +3,7 @@
 # (builtin-baseline).
 # The last stage holds only the tool's prefix,
 # which the launcher copies into the tool's volume.
-ARG BASE_IMAGE=dockered-claude:latest
+ARG BASE_IMAGE=dockered-claude-default:latest
 FROM ${BASE_IMAGE} AS build
 
 USER root
