@@ -29,6 +29,7 @@ reset_clean() {
   fake_volume_listing=''
   fake_image_ids=sha256:base
   fake_packages_listing=''
+  fake_run_ids=''
   fake_profile_listing=''
   fake_old_listing=''
   fake_current_image=''
@@ -52,6 +53,9 @@ docker() {
     ;;
   'volume ls '*) printf '%s' "${fake_volume_listing}" ;;
   'image ls --all --no-trunc --quiet') printf '%s\n' "${fake_image_ids}" ;;
+  'image ls --quiet --no-trunc --filter label=dockered-claude.run=1')
+    printf '%s' "${fake_run_ids}"
+    ;;
   'image ls --quiet '*)
     [[ -z "${fake_packages_listing}" ]] || cut -d ' ' -f 1 <<<"${fake_packages_listing}"
     ;;
@@ -158,6 +162,30 @@ test_containers_offers_stopped_and_fill_containers() {
   assert_equal \
     $'container quirky_name: stopped, of image dockered-claude-default:latest\ncontainer dockered-claude-tool-default-uv-3-fill: left from filling dockered-claude-tool-default-uv-3' \
     "${output}"
+}
+
+test_containers_offers_run_images_that_no_container_uses() {
+  reset_clean
+  kwargs[dry_run]=1
+  args=(containers)
+  fake_run_ids=$'sha256:r1\nsha256:r2\n'
+  fake_users_of["ancestor=sha256:r2"]=container
+  capture clean_unused
+  assert_status 0
+  assert_equal 'image sha256:r1: run image that no container uses' "${output}"
+}
+
+test_packages_and_profiles_leave_run_images_out() {
+  reset_clean
+  kwargs[dry_run]=1
+  args=(packages profiles)
+  fake_run_ids=$'sha256:r1\nsha256:r2\n'
+  fake_packages_listing=$'sha256:r1 <none>:<none>\n'
+  fake_profile_listing=$'sha256:r1 <none>:<none>\nsha256:r2 <none>:<none>\n'
+  capture clean_unused
+  assert_status 0
+  assert_equal '' "${output}"
+  assert_equal "${script_name}: nothing to clean" "${errors}"
 }
 
 test_packages_says_how_each_image_stands() {

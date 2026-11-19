@@ -44,7 +44,9 @@ Commands:
                           generation of its volume
   clean TARGET...         Offer for removal, one item at a time, what the
                           launcher left unused; TARGET is one of:
-                          containers  stopped containers left behind
+                          containers  stopped containers left behind,
+                                      and images of runs whose launcher
+                                      was killed
                           tools       older generations of tool volumes
                                       built from the same profile image,
                                       those built from a profile image no
@@ -594,8 +596,6 @@ resolve_paths() {
   home="/home/${username}"
   state_dir="${DOCKERED_CLAUDE_HOME:-${XDG_STATE_HOME:-${HOME:?}/.local/state}/dockered-claude}"
   state_home="${state_dir}/home/${username}"
-  passwd_file="${state_dir}/etc/passwd"
-  group_file="${state_dir}/etc/group"
   agents_dir="${HOME:?}/.agents"
   config_dir="${HOME:?}/.config/claude"
   git_config_dir="${HOME:?}/.config/git"
@@ -1488,9 +1488,8 @@ list_profiles() {
 prepare_state_directory() {
   # Claude Code keeps its state in ~/.claude/ and ~/.claude.json; both end
   # up inside the persisted home directory.
-  # The passwd and group files live in etc/, mirroring their mount paths.
-  mkdir -p -- "${state_home}/.claude/skills" "${state_dir}/etc" || return
-  chmod 700 -- "${state_dir}" "${state_dir}/etc" "${state_dir}/home" \
+  mkdir -p -- "${state_home}/.claude/skills" || return
+  chmod 700 -- "${state_dir}" "${state_dir}/home" \
     "${state_home}" "${state_home}/.claude" || return
 }
 
@@ -1544,13 +1543,17 @@ prepare_mount_points() {
   fi
 }
 
-prepare_user_identity() {
+# Write the container's passwd and group files under DIRECTORY/etc,
+# naming only root and the host's user and group, readable by all.
+write_user_identity() {
+  declare directory="$1"
+  mkdir -p -- "${directory}/etc" || return
   printf 'root:x:0:0:root:/root:/bin/bash\n%s:x:%s:%s:%s:%s:/bin/bash\n' \
     "${username}" "${uid_host}" "${gid_host}" "${username}" "${home}" \
-    >"${passwd_file}" || return
+    >"${directory}/etc/passwd" || return
   printf 'root:x:0:\n%s:x:%s:\n' "${groupname}" "${gid_host}" \
-    >"${group_file}" || return
-  chmod 600 -- "${passwd_file}" "${group_file}" || return
+    >"${directory}/etc/group" || return
+  chmod 644 -- "${directory}/etc/passwd" "${directory}/etc/group" || return
 }
 
 # Symlink each skill in ~/.agents/skills
@@ -1875,8 +1878,6 @@ add_base_arguments() {
     --env "TERM=${TERM:-xterm-256color}"
     --init
     --interactive
-    --mount "type=bind,src=${group_file},dst=/etc/group,readonly"
-    --mount "type=bind,src=${passwd_file},dst=/etc/passwd,readonly"
     --read-only
     --rm
     --security-opt seccomp=unconfined
@@ -2163,6 +2164,77 @@ fill_tool_volume() {
   fi
 }
 
+# Write in DIRECTORY/root the files of the run image,
+# and DIRECTORY/context/run.tar with them:
+# /etc/passwd and /etc/group, owned by root,
+# and the home, owned by the user, 0700.
+# The tar has no entries for the directories above them,
+# so the base image's own keep their owner and mode,
+# and Docker creates missing ones as root, 0755.
+write_run_archive() {
+  declare directory="$1"
+  declare root="${directory}/root" archive="${directory}/context/run.tar"
+  write_user_identity "${root}" || return
+  mkdir -p -- "${root}${home}" "${archive%/*}" || return
+  chmod 700 -- "${root}${home}" || return
+  tar --create --file "${archive}" --directory "${root}" \
+    --owner=0 --group=0 --numeric-owner \
+    etc/passwd etc/group || return
+  tar --append --file "${archive}" --directory "${root}" \
+    --owner="${uid_host}" --group="${gid_host}" --numeric-owner \
+    --no-recursion "${home#/}" || return
+}
+
+# Build the run image of this run from container_image,
+# with the files of write_run_archive added,
+# untagged, labelled dockered-claude.run,
+# in a temporary directory removed afterwards,
+# and set run_image to its ID.
+build_run_image() {
+  declare directory status=0
+  directory="$(mktemp -d)" || return
+  build_run_image_in "${directory}" || status=$?
+  rm -rf -- "${directory}" || return
+  return "${status}"
+}
+
+build_run_image_in() {
+  declare directory="$1" base_id
+  base_id="$(docker image inspect --format '{{.Id}}' "${container_image}")" ||
+    return
+  write_run_archive "${directory}" || return
+  cat >"${directory}/context/Dockerfile" <<'DOCKERFILE' || return
+ARG BASE_IMAGE_ID
+FROM ${BASE_IMAGE_ID}
+ADD run.tar /
+DOCKERFILE
+  docker build \
+    --build-arg "BASE_IMAGE_ID=${base_id}" \
+    --iidfile "${directory}/id" \
+    --label dockered-claude.run=1 \
+    --label "dockered-claude.profile=${profile}" \
+    --quiet \
+    "${directory}/context" >/dev/null || return
+  run_image="$(<"${directory}/id")" || return
+  if [[ -z "${run_image}" ]]; then
+    warn "the build of the run image gave no image ID"
+    return 1
+  fi
+}
+
+# Remove the run images that killed launchers left,
+# those no container uses, without asking.
+# Only those older than 10 minutes are removed,
+# so that the image of another run,
+# built but whose container has not started yet, is kept.
+# A failure only warns, since it does not keep this run from starting.
+prune_run_images() {
+  docker image prune --force \
+    --filter label=dockered-claude.run=1 \
+    --filter until=10m >/dev/null ||
+    warn "could not remove the images left by earlier runs"
+}
+
 run_container() {
   declare -a docker_args=() path_entries=() path_suffix=()
   add_base_arguments || return
@@ -2238,7 +2310,30 @@ run_container() {
     )
   fi
 
-  exec docker "${docker_args[@]}" "${container_image}" "$@"
+  # Docker is not exec'd, so that the run image can be removed after it.
+  # Until then, a signal only sets the status to return:
+  # the container gets it from docker run, or from the terminal,
+  # and stops, and docker run returns.
+  # An image left by a launcher that is killed is pruned by a later run.
+  declare run_image='' interrupted=''
+  declare -i status=0
+  trap 'interrupted=129' HUP
+  trap 'interrupted=130' INT
+  trap 'interrupted=143' TERM
+  prune_run_images
+  if ! build_run_image; then
+    status=1
+  elif [[ -n "${interrupted}" ]]; then
+    status="${interrupted}"
+  else
+    docker "${docker_args[@]}" "${run_image}" "$@" || status=$?
+  fi
+  if [[ -n "${run_image}" ]]; then
+    docker image rm "${run_image}" >/dev/null ||
+      warn "could not remove the run image ${run_image}"
+  fi
+  trap - HUP INT TERM
+  return "${status}"
 }
 
 # Offer for removal, one item at a time,
@@ -2330,8 +2425,10 @@ remove_item() {
 # and those created to fill a tool volume,
 # which a build removes at once, unless it is interrupted.
 # A running or paused container is never offered.
+# Also add the run images that no container uses,
+# which a run removes when it ends, unless its launcher is killed.
 find_unused_containers() {
-  declare listing fill_listing id name image
+  declare listing fill_listing run_ids id name image users
   declare -A seen=()
   declare -a stopped=(
     --filter status=created
@@ -2355,6 +2452,20 @@ find_unused_containers() {
     [[ "${name}" == dockered-claude-tool-*-fill ]] || continue
     add_item container "${name}" "left from filling ${name%-fill}"
   done <<<"${fill_listing}"
+
+  find_run_images || return
+  while read -r id; do
+    [[ -n "${id}" ]] || continue
+    find_users "ancestor=${id}" || return
+    [[ -z "${users}" ]] || continue
+    add_item image "${id}" "run image that no container uses"
+  done <<<"${run_ids}"
+}
+
+# Set run_ids to the IDs of the run images, one per line.
+find_run_images() {
+  run_ids="$(docker image ls --quiet --no-trunc \
+    --filter label=dockered-claude.run=1)" || return
 }
 
 # Add the tool volumes that no container uses, running or not:
@@ -2417,15 +2528,18 @@ find_unused_tools() {
 # its profile is no longer defined,
 # it was built from an older image of its profile,
 # or it is current; a run rebuilds one it needs.
+# Run images inherit the labels of a packages image, so they are left out.
 find_unused_packages() {
-  declare listing id reference repository name labels base_image
+  declare listing run_ids id reference repository name labels base_image
   declare package_names current reason users
   listing="$(docker image ls --no-trunc \
     --filter label=dockered-claude.packages \
     --format '{{.ID}} {{.Repository}}:{{.Tag}}')" || return
+  find_run_images || return
 
   while read -r id reference; do
     [[ -n "${id}" ]] || continue
+    [[ $'\n'"${run_ids}"$'\n' != *$'\n'"${id}"$'\n'* ]] || continue
     find_users "ancestor=${id}" || return
     [[ -z "${users}" ]] || continue
     labels="$(docker image inspect --format \
@@ -2458,13 +2572,15 @@ find_unused_packages() {
 # images that a later build left untagged,
 # all images of a profile no longer defined,
 # and images named dockered-claude, from earlier versions of the launcher.
-# Packages images carry their profile's label too, so they are left out.
+# Packages images and run images carry their profile's label too,
+# so they are left out.
 find_unused_profiles() {
-  declare packages_ids listing old_listing id reference repository reason
+  declare packages_ids run_ids listing old_listing id reference repository reason
   declare users tag name
   declare -A seen=() latest_ids=()
   packages_ids="$(docker image ls --quiet --no-trunc \
     --filter label=dockered-claude.packages)" || return
+  find_run_images || return
   listing="$(docker image ls --no-trunc \
     --filter label=dockered-claude.profile \
     --format '{{.ID}} {{.Repository}}:{{.Tag}}')" || return
@@ -2480,6 +2596,7 @@ find_unused_profiles() {
     [[ -n "${id}" && -z "${seen[${reference}]+defined}" ]] || continue
     seen[${reference}]=1
     [[ $'\n'"${packages_ids}"$'\n' != *$'\n'"${id}"$'\n'* ]] || continue
+    [[ $'\n'"${run_ids}"$'\n' != *$'\n'"${id}"$'\n'* ]] || continue
     repository="${reference%:*}"
     tag="${reference##*:}"
     name="${repository#dockered-claude-}"
@@ -2521,7 +2638,7 @@ build_images() {
 # or clean the targets in args.
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
-  declare home passwd_file group_file agents_dir config_dir git_config_dir
+  declare home agents_dir config_dir git_config_dir
   declare managed_settings_file profile_image_id profile_generation
   declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=()
@@ -2595,7 +2712,6 @@ run() {
   read_profile_launcher || return
   warn_missing_climbed_directories
   prepare_mount_points || return
-  prepare_user_identity || return
   link_agent_skills || return
   link_config_files || return
   ensure_image || return
