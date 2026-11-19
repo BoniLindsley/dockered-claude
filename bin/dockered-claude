@@ -929,7 +929,7 @@ build_image() {
   docker build \
     --pull \
     --tag "${image}" \
-    "${project_directory}" || return
+    "${project_directory}/profiles/default" || return
 }
 
 ensure_image() {
