@@ -120,6 +120,7 @@ reset_managed_settings() {
   HOME="${temporary_directory}/home"
   workdir="${temporary_directory}/work"
   managed_settings_file="${HOME}/.config/dockered-claude/managed-settings.json"
+  user_config="${HOME}/.config/dockered-claude/config"
   profile_settings="${project_directory}/profiles/default/managed-settings.json"
   declare -ga mount_paths=()
   declare -gA mount_modes=()
@@ -366,4 +367,14 @@ drwxr-xr-x 1000/1001 ${home#/}/.local/
 drwxr-xr-x 1000/1001 ${home#/}/.local/share/
 drwxr-xr-x 1000/1001 ${home#/}/notes/
 drwxr-xr-x 1000/1001 ${home#/}/src/" "$(sed 1,3d -- "${build}")"
+}
+
+test_the_user_configuration_in_a_writable_path_is_mounted_read_only() {
+  reset_managed_settings
+  mount_paths=("${HOME}")
+  mount_modes["${HOME}"]=rw
+  capture_run_container
+  assert_status 0
+  assert_contains "${output}" \
+    "type=bind,src=${user_config%/*},dst=${user_config%/*},readonly"
 }

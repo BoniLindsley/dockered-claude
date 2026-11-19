@@ -15,6 +15,7 @@ reset_state() {
   state_dir="${temporary_directory}/state"
   state_home="${state_dir}/home/claude"
   claude_state="${state_dir}/tools/claude-code/.claude"
+  persists_home="${state_dir}/persists/home/claude"
   fake_running=''
   # shellcheck disable=SC2329 # Called by migrate_state.
   docker() {
@@ -38,11 +39,40 @@ test_migrating_moves_the_directory_then_the_configuration_into_it() {
   assert_status 0
   assert_file "${claude_state}/history.jsonl" history
   assert_file "${claude_state}/.claude.json" '{}'
-  [[ ! -e "${state_home}/.claude" && ! -e "${state_home}/.claude.json" ]] ||
-    fail "expected the old state to be gone"
+  [[ ! -e "${state_home}" && ! -e "${state_dir}/home" ]] ||
+    fail "expected the old home to be gone"
+  [[ -d "${persists_home}" ]] || fail "expected the old home in persists"
   assert_equal "${script_name}: moved ${state_home}/.claude to ${claude_state}
-${script_name}: moved ${state_home}/.claude.json to ${claude_state}/.claude.json" \
+${script_name}: moved ${state_home}/.claude.json to ${claude_state}/.claude.json
+${script_name}: moved ${state_home} to ${persists_home}" \
     "${errors}"
+}
+
+test_migrating_moves_the_rest_of_the_home_to_persists() {
+  reset_state
+  # Claude Code's state was migrated already,
+  # and a run made an empty .claude as a mount point since.
+  mkdir -p -- "${claude_state}" "${state_home}/.claude" "${state_home}/.npm" \
+    "${state_dir}/home/other"
+  printf 'ls\n' >"${state_home}/.bash_history"
+  capture migrate_state
+  assert_status 0
+  assert_file "${persists_home}/.bash_history" ls
+  [[ -d "${persists_home}/.npm" && ! -e "${persists_home}/.claude" ]] ||
+    fail "expected .npm kept and the empty .claude dropped"
+  [[ -d "${state_dir}/home/other" ]] || fail "expected other homes kept"
+  assert_equal "${script_name}: moved ${state_home} to ${persists_home}" \
+    "${errors}"
+}
+
+test_migrating_the_home_never_overwrites_persists() {
+  reset_state
+  mkdir -p -- "${state_home}" "${persists_home}"
+  capture migrate_state
+  assert_status 1
+  assert_equal "${script_name}: cannot move ${state_home}: ${persists_home} exists" \
+    "${errors}"
+  [[ -d "${state_home}" ]] || fail "expected the old home kept"
 }
 
 test_migrating_is_refused_while_a_container_runs() {
@@ -72,7 +102,7 @@ test_migrating_never_overwrites() {
 
 test_migrating_without_old_state_says_so() {
   reset_state
-  mkdir -p -- "${state_home}/.claude"
+  mkdir -p -- "${state_dir}"
   capture migrate_state
   assert_status 0
   assert_equal "${script_name}: nothing to migrate" "${errors}"
@@ -91,14 +121,19 @@ test_a_run_after_migrating_or_without_state_goes_ahead() {
   reset_state
   capture check_migrated_state
   assert_status 0
+  mkdir -p -- "${claude_state}" "${persists_home}"
+  capture check_migrated_state
+  assert_status 0
+}
+
+test_a_run_with_the_old_home_fails_naming_the_command() {
+  reset_state
   # An earlier run made .claude as an empty mount point.
-  mkdir -p -- "${state_home}/.claude"
+  mkdir -p -- "${state_home}/.claude" "${claude_state}"
   capture check_migrated_state
-  assert_status 0
-  make_old_state
-  mkdir -p -- "${claude_state}"
-  capture check_migrated_state
-  assert_status 0
+  assert_status 1
+  assert_equal "${script_name}: the home of an earlier version is in ${state_home}; move it with: ${script_name} migrate" \
+    "${errors}"
 }
 
 test_preparing_the_state_makes_it_private_to_the_user() {

@@ -624,10 +624,16 @@ resolve_paths() {
   state_dir="${DOCKERED_CLAUDE_HOME:-${XDG_STATE_HOME:-${HOME:?}/.local/state}/dockered-claude}"
   state_home="${state_dir}/home/${username}"
   claude_state="${state_dir}/tools/claude-code/.claude"
+  # Persisted paths are stored at their paths in the container,
+  # those in the home at persists/home/<user>,
+  # leaving room for other absolute paths.
+  persists_home="${state_dir}/persists${home}"
   agents_dir="${HOME:?}/.agents"
   config_dir="${HOME:?}/.config/claude"
   git_config_dir="${HOME:?}/.config/git"
   # Resolved, to compare with the resolved paths of writable mounts.
+  user_config="$(realpath -m -- "${HOME:?}/.config/dockered-claude/config")" ||
+    return
   managed_settings_file="$(realpath -m -- \
     "${HOME:?}/.config/dockered-claude/managed-settings.json")" || return
 }
@@ -1185,7 +1191,9 @@ add_persisted_path() {
 # those in the home file of each tool in mounted_tools,
 # stored in tools/<tool> of the state directory;
 # then those that profile_home of the profile's launcher.bash prints,
-# stored in profiles/<profile>.
+# stored in profiles/<profile>;
+# then those of the user configuration, in user_persists,
+# stored in persists_home, shared by all projects and profiles.
 # A home file has a path per line, and blank lines and # comments.
 select_persisted_paths() {
   declare tool file line
@@ -1210,6 +1218,10 @@ select_persisted_paths() {
     add_persisted_path "${line}" "${state_dir}/profiles/${profile}" \
       "${project_directory}/profiles/${profile}/launcher.bash: profile_home" ||
       return
+  done
+
+  for line in "${user_persists[@]}"; do
+    add_persisted_path "${line}" "${persists_home}" "${user_config}" || return
   done
 }
 
@@ -1427,6 +1439,74 @@ find_project_config() {
     main_worktree="${common_dir%/.git}"
   fi
   project_config="${main_worktree:-${workdir}}/${project_config_path}"
+}
+
+# Read user_config, if it exists, into user_mounts and user_persists,
+# from its "mount = PATH[:rw]" and "persists = PATH" lines,
+# each of which may be given any number of times,
+# with a leading ~/ of their paths removed:
+# a mount path is relative to the host home,
+# and a persisted path to the container's.
+# Other lines are blank or comments.
+read_user_config() {
+  [[ -f "${user_config}" ]] || return 0
+  declare line key value home_path home_kind
+  declare -i number=0
+  declare skip='^[[:space:]]*(#|$)'
+  declare setting='^[[:space:]]*([a-z]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$'
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    number+=1
+    [[ "${line}" =~ ${skip} ]] && continue
+    if [[ ! "${line}" =~ ${setting} ]]; then
+      warn "${user_config}:${number}: expected KEY = VALUE"
+      return 1
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#\~/}"
+    case "${key}" in
+    mount)
+      if ! validate_mount_spec "${value}"; then
+        warn "${user_config}:${number}: invalid mount"
+        return 1
+      fi
+      user_mounts+=("${value}")
+      ;;
+    persists)
+      if ! validate_home_path "${value}"; then
+        warn "${user_config}:${number}: invalid persisted path"
+        return 1
+      fi
+      user_persists+=("${value}")
+      ;;
+    *)
+      warn "${user_config}:${number}: unknown key '${key}'"
+      return 1
+      ;;
+    esac
+  done <"${user_config}"
+}
+
+# Add the existing paths of user_mounts that are not mounted already,
+# relative to the host home,
+# marking them in unsaved_mount_paths so that they are never saved.
+# They are added with --no-mounts too, like the profile's.
+add_user_mounts() {
+  declare spec mount_path mount_mode mount_given
+  for spec in "${user_mounts[@]}"; do
+    resolve_mount_spec "${spec}" "${HOME:?}" || return
+    if [[ ! -e "${mount_path}" ]]; then
+      warn "skipping user mount '${mount_path}': it does not exist"
+      continue
+    fi
+    [[ -z "${mount_modes[${mount_path}]+defined}" ]] || continue
+    if ! add_mount; then
+      warn "${user_config}: cannot mount '${mount_path}'"
+      return 1
+    fi
+    unsaved_mount_paths[${mount_path}]=1
+  done
 }
 
 # Read project_config into project_options, and its mounts into project_mounts.
@@ -1724,20 +1804,32 @@ find_unmigrated_state() {
 
 # Fail when Claude Code's state is still where earlier versions kept it
 # and not yet in claude_state,
-# rather than start with empty state beside it.
+# rather than start with empty state beside it,
+# or when the home of earlier versions, state_home, is still there,
+# rather than leave it apart from persists_home.
 check_migrated_state() {
-  [[ ! -e "${claude_state}" ]] || return 0
-  declare paths
-  paths="$(find_unmigrated_state)" || return
-  [[ -n "${paths}" ]] || return 0
-  warn "Claude Code's state from an earlier version is in" \
-    "${paths//$'\n'/ and }; move it with: ${script_name} migrate"
-  return 1
+  declare paths=''
+  if [[ ! -e "${claude_state}" ]]; then
+    paths="$(find_unmigrated_state)" || return
+  fi
+  if [[ -n "${paths}" ]]; then
+    warn "Claude Code's state from an earlier version is in" \
+      "${paths//$'\n'/ and }; move it with: ${script_name} migrate"
+    return 1
+  fi
+  if [[ -e "${state_home}" || -L "${state_home}" ]]; then
+    warn "the home of an earlier version is in ${state_home};" \
+      "move it with: ${script_name} migrate"
+    return 1
+  fi
 }
 
 # Move Claude Code's state from where earlier versions kept it
 # to claude_state: the .claude directory, then .claude.json into it,
-# where CLAUDE_CONFIG_DIR makes Claude Code look for it.
+# where CLAUDE_CONFIG_DIR makes Claude Code look for it;
+# then the rest of the home of earlier versions, state_home,
+# to persists_home, without the empty .claude that runs of them made,
+# where persists lines of the user configuration take paths from.
 # Refuse while a container of the launcher runs or is paused,
 # since it may write to the state being moved,
 # and refuse to move onto anything that exists.
@@ -1745,7 +1837,7 @@ check_migrated_state() {
 migrate_state() {
   declare paths running path destination
   paths="$(find_unmigrated_state)" || return
-  if [[ -z "${paths}" ]]; then
+  if [[ -z "${paths}" && ! -e "${state_home}" && ! -L "${state_home}" ]]; then
     warn "nothing to migrate"
     return 0
   fi
@@ -1771,7 +1863,21 @@ migrate_state() {
     mkdir -p -- "${destination%/*}" || return
     mv -- "${path}" "${destination}" || return
     warn "moved ${path} to ${destination}"
-  done <<<"${paths}"
+  done < <([[ -z "${paths}" ]] || printf '%s\n' "${paths}")
+
+  [[ -e "${state_home}" || -L "${state_home}" ]] || return 0
+  if [[ -e "${persists_home}" || -L "${persists_home}" ]]; then
+    warn "cannot move ${state_home}: ${persists_home} exists"
+    return 1
+  fi
+  if empty_directory "${state_home}/.claude"; then
+    rmdir -- "${state_home}/.claude" || return
+  fi
+  mkdir -p -- "${persists_home%/*}" || return
+  mv -- "${state_home}" "${persists_home}" || return
+  warn "moved ${state_home} to ${persists_home}"
+  # Other users' homes may be left in it.
+  rmdir -- "${state_home%/*}" 2>/dev/null || :
 }
 
 # Write the container's passwd and group files under DIRECTORY/etc,
@@ -2545,13 +2651,14 @@ run_container() {
   # whether through the working directory or a writable mount:
   # this project's, and that of a project a writable mount is the root of.
   # Configurations deeper inside a writable mount are not looked for.
-  # Nor must the managed settings files,
+  # Nor must the user configuration and the managed settings files,
   # such as the profile's when the launcher's own repository is the
   # working directory.
   declare protected_path
   declare -A protected=()
   for protected_path in "${project_config%/*}" \
     "${writable_paths[@]/%//${project_config_path%/*}}" \
+    "${user_config%/*}" \
     "${project_directory}/profiles/${profile}/managed-settings.json" \
     "${managed_settings_file}"; do
     [[ -e "${protected_path}" ]] || continue
@@ -2920,9 +3027,11 @@ run() {
   declare image workdir state_dir state_home claude_state
   declare uid_host gid_host username groupname
   declare home agents_dir config_dir git_config_dir
-  declare managed_settings_file profile_image_id profile_generation
+  declare managed_settings_file user_config persists_home
+  declare profile_image_id profile_generation
   declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=() persisted_paths=()
+  declare -a user_mounts=() user_persists=()
   declare -A persisted_kinds=() persisted_bases=() persisted_sources=()
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() unsaved_mount_paths=()
@@ -2990,6 +3099,7 @@ run() {
   find_project_config || return
   project_root="${project_config%/"${project_config_path}"}"
   read_project_config || return
+  read_user_config || return
   select_profile || return
   select_tools || return
   select_mounted_tools
@@ -2999,6 +3109,7 @@ run() {
   trace_working_directory || return
   select_mounts || return
   read_profile_launcher || return
+  add_user_mounts || return
   warn_missing_climbed_directories
   select_run_links
   prepare_persisted_paths || return

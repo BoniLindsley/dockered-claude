@@ -15,10 +15,12 @@ source -- "${launcher}" || return
 # the tools node and uv, and the profile default without a launcher.bash.
 reset_home() {
   set_launcher_paths
-  declare -ga mounted_tools=(node claude-code) persisted_paths=()
+  declare -ga mounted_tools=(node claude-code) persisted_paths=() user_persists=()
   declare -gA persisted_kinds=() persisted_bases=() persisted_sources=()
   project_directory="${temporary_directory}/launcher"
   state_dir="${temporary_directory}/state"
+  persists_home="${state_dir}/persists/home/someone"
+  user_config="${temporary_directory}/user/config"
   home=/home/someone
   workdir=/home/someone/project
   profile=default
@@ -177,4 +179,21 @@ test_preparing_refuses_the_other_kind() {
   capture prepare_persisted_paths
   assert_status 1
   assert_contains "${errors}" "${state_dir}/x/.npm is not a file"
+}
+
+test_the_users_persisted_paths_come_last_and_are_shared() {
+  reset_home
+  write_profile_home .gradle/
+  user_persists=(.bash_history notes/)
+  capture select_persisted_paths
+  assert_status 0
+  assert_array persisted_paths .npm .claude .gradle .bash_history notes
+  assert_equal "${persists_home}" "${persisted_bases[".bash_history"]}"
+  assert_equal directory "${persisted_kinds[notes]}"
+  assert_equal "${user_config}" "${persisted_sources[notes]}"
+  user_persists=(.npm/)
+  persisted_paths=()
+  capture select_persisted_paths
+  assert_status 1
+  assert_contains "${errors}" "${user_config}: cannot persist /home/someone/.npm"
 }
