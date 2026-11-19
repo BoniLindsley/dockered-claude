@@ -110,3 +110,86 @@ test_claude_code_is_always_mounted_and_last() {
   select_mounted_tools
   assert_array mounted_tools claude-code
 }
+
+# Set the paths that add_managed_settings_arguments and run_container read,
+# for the profile default, with the user's files under HOME
+# and the state in temporary_directory, none of them created.
+reset_managed_settings() {
+  reset_container
+  set_profile default
+  HOME="${temporary_directory}/home"
+  workdir="${temporary_directory}/work"
+  managed_settings_file="${HOME}/.config/dockered-claude/managed-settings.json"
+  profile_settings="${project_directory}/profiles/default/managed-settings.json"
+  declare -ga mount_paths=()
+  declare -gA mount_modes=()
+  project_config="${workdir}/${project_config_path}"
+  state_dir="${temporary_directory}/state"
+  home="${HOME}"
+  agents_dir="${HOME}/.agents"
+  config_dir="${HOME}/.config/claude"
+  git_config_dir="${HOME}/.config/git"
+  passwd_file="${state_dir}/etc/passwd"
+  group_file="${state_dir}/etc/group"
+  uid_host=1000
+  gid_host=1000
+  mkdir -p -- "${project_directory}/profiles/default" "${workdir}" \
+    "${HOME}/.config/dockered-claude"
+}
+
+test_managed_settings_are_mounted_only_when_present() {
+  reset_managed_settings
+  capture add_managed_settings_arguments
+  assert_status 0
+  assert_array docker_args
+}
+
+test_the_users_managed_settings_follow_the_profiles() {
+  reset_managed_settings
+  printf '{}\n' >"${profile_settings}"
+  printf '{}\n' >"${managed_settings_file}"
+  capture add_managed_settings_arguments
+  assert_status 0
+  assert_array docker_args \
+    --mount "type=bind,src=${profile_settings},dst=/etc/claude-code/managed-settings.json,readonly" \
+    --mount "type=bind,src=${managed_settings_file},dst=/etc/claude-code/managed-settings.d/50-dockered-claude-user.json,readonly"
+}
+
+# Run run_container in a subshell, with a docker on PATH
+# that prints its arguments, one per line, which exec runs;
+# set output to them.
+capture_run_container() {
+  declare bin="${temporary_directory}/bin"
+  mkdir -p -- "${bin}"
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@"' >"${bin}/docker"
+  chmod +x -- "${bin}/docker"
+  unset -f docker
+  output="$(PATH="${bin}:${PATH}" && run_container)"
+}
+
+test_managed_settings_in_a_writable_path_are_mounted_read_only() {
+  reset_managed_settings
+  # The launcher's own repository is the working directory.
+  workdir="${project_directory}"
+  mkdir -p -- "${temporary_directory}/notes"
+  managed_settings_file="${temporary_directory}/notes/managed-settings.json"
+  mount_paths=("${temporary_directory}/notes")
+  mount_modes["${temporary_directory}/notes"]=rw
+  printf '{}\n' >"${profile_settings}"
+  printf '{}\n' >"${managed_settings_file}"
+  capture_run_container
+  assert_contains "${output}" \
+    "type=bind,src=${profile_settings},dst=${profile_settings},readonly"
+  assert_contains "${output}" \
+    "type=bind,src=${managed_settings_file},dst=${managed_settings_file},readonly"
+}
+
+test_managed_settings_outside_writable_paths_are_not_mounted_again() {
+  reset_managed_settings
+  printf '{}\n' >"${profile_settings}"
+  printf '{}\n' >"${managed_settings_file}"
+  capture_run_container
+  [[ "${output}" != *"dst=${profile_settings}"* &&
+    "${output}" != *"dst=${managed_settings_file}"* ]] ||
+    fail "expected no mount at the files' own paths: ${output}"
+}

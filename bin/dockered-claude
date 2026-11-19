@@ -93,6 +93,14 @@ Configuration:
   is managed on the host while the rest of ~/.claude stays writable state.
   ~/.config/git is mounted read-only, so git uses the host's configuration.
 
+Managed settings:
+  A profile's managed-settings.json, and the user's
+  ~/.config/dockered-claude/managed-settings.json, are mounted read-only
+  where Claude Code reads managed settings, which outrank every settings
+  file a session can edit, such as .claude/settings.local.json. Rules
+  from both apply; where both set a single value, the user's wins. A file
+  that is not a JSON object stops Claude Code from starting.
+
 Project configuration:
   ${project_config_path} holds options for a project as "KEY = VALUE"
   lines and # comments. It is read as data and never run. It is looked for
@@ -508,6 +516,9 @@ resolve_paths() {
   agents_dir="${HOME:?}/.agents"
   config_dir="${HOME:?}/.config/claude"
   git_config_dir="${HOME:?}/.config/git"
+  # Resolved, to compare with the resolved paths of writable mounts.
+  managed_settings_file="$(realpath -m -- \
+    "${HOME:?}/.config/dockered-claude/managed-settings.json")" || return
 }
 
 # Choose the profile from --profile,
@@ -1425,6 +1436,31 @@ add_tool_arguments() {
   docker_args+=("${env_args[@]}")
 }
 
+# Mount the profile's managed-settings.json, if it has one,
+# where Claude Code reads managed settings,
+# and the user's, if any, as a drop-in in managed-settings.d,
+# which Claude Code merges after it:
+# lists such as permissions.deny combine,
+# and the user's single values replace the profile's.
+# Managed settings outrank the project's settings files,
+# which the container can write,
+# so they are mounted read-only, as files,
+# leaving the rest of the image's /etc/claude-code in place.
+add_managed_settings_arguments() {
+  declare profile_file="${project_directory}/profiles/${profile}/managed-settings.json"
+  declare destination=/etc/claude-code
+  if [[ -f "${profile_file}" ]]; then
+    docker_args+=(
+      --mount "type=bind,src=${profile_file},dst=${destination}/managed-settings.json,readonly"
+    )
+  fi
+  if [[ -f "${managed_settings_file}" ]]; then
+    docker_args+=(
+      --mount "type=bind,src=${managed_settings_file},dst=${destination}/managed-settings.d/50-dockered-claude-user.json,readonly"
+    )
+  fi
+}
+
 # Pass the host variables in profile_variables,
 # and add profile_path_entries to path_entries, after the tools.
 add_profile_arguments() {
@@ -1633,6 +1669,7 @@ run_container() {
   add_base_arguments || return
   add_tool_arguments || return
   add_profile_arguments || return
+  add_managed_settings_arguments || return
   add_path_argument || return
   docker_args+=(
     --env "HOME=${home}"
@@ -1657,17 +1694,22 @@ run_container() {
   # whether through the working directory or a writable mount:
   # this project's, and that of a project a writable mount is the root of.
   # Configurations deeper inside a writable mount are not looked for.
-  declare config_dir_path
+  # Nor must the managed settings files,
+  # such as the profile's when the launcher's own repository is the
+  # working directory.
+  declare protected_path
   declare -A protected=()
-  for config_dir_path in "${project_config%/*}" \
-    "${writable_paths[@]/%//${project_config_path%/*}}"; do
-    [[ -d "${config_dir_path}" ]] || continue
-    [[ -z "${protected[${config_dir_path}]+defined}" ]] || continue
+  for protected_path in "${project_config%/*}" \
+    "${writable_paths[@]/%//${project_config_path%/*}}" \
+    "${project_directory}/profiles/${profile}/managed-settings.json" \
+    "${managed_settings_file}"; do
+    [[ -e "${protected_path}" ]] || continue
+    [[ -z "${protected[${protected_path}]+defined}" ]] || continue
     for path in "${writable_paths[@]}"; do
-      [[ "${config_dir_path}" == "${path%/}/"* ]] || continue
-      protected[${config_dir_path}]=1
+      [[ "${protected_path}" == "${path%/}/"* ]] || continue
+      protected[${protected_path}]=1
       docker_args+=(
-        --mount "type=bind,src=${config_dir_path},dst=${config_dir_path},readonly"
+        --mount "type=bind,src=${protected_path},dst=${protected_path},readonly"
       )
       break
     done
@@ -1953,6 +1995,7 @@ build_images() {
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
   declare home passwd_file group_file agents_dir config_dir git_config_dir
+  declare managed_settings_file
   declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=()
   declare -a profile_variables=() profile_path_entries=()
