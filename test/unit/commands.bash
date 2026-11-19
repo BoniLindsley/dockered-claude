@@ -95,7 +95,7 @@ test_building_a_profile_without_the_cache_passes_no_cache() {
 
 test_building_a_profile_adds_a_generation_after_the_newest() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\n3 sha256:c 2 days ago\nlatest sha256:a 2 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\n3 sha256:c 2 days ago\nlatest sha256:a 2 weeks ago\n'
   capture build_image
   assert_status 0
   assert_contains "$(<"${calls}")" \
@@ -104,7 +104,7 @@ test_building_a_profile_adds_a_generation_after_the_newest() {
 
 test_building_a_profile_as_built_already_marks_that_generation() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:b 2 days ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:b 2 days ago\n'
   fake_build_id=sha256:a
   capture build_image
   assert_status 0
@@ -115,7 +115,7 @@ test_building_a_profile_as_built_already_marks_that_generation() {
 
 test_building_a_profile_keeps_an_earlier_latest_as_a_generation() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'latest sha256:old 3 months ago\n'
+  fake_images["dockered-claude-default"]=$'latest sha256:old 3 months ago\n'
   capture build_image
   assert_status 0
   assert_equal $'docker tag sha256:old dockered-claude-default:1\ndocker tag sha256:new dockered-claude-default:2\ndocker tag sha256:new dockered-claude-default:latest' \
@@ -124,7 +124,7 @@ test_building_a_profile_keeps_an_earlier_latest_as_a_generation() {
 
 test_profile_use_marks_a_generation_latest() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:b 2 days ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:b 2 days ago\n'
   parse_arguments profile use default 1
   capture run
   assert_status 0
@@ -133,7 +133,7 @@ test_profile_use_marks_a_generation_latest() {
 
 test_profile_use_refuses_a_missing_generation() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\nlatest sha256:a 2 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\nlatest sha256:a 2 weeks ago\n'
   parse_arguments profile use default 2
   capture run
   assert_status 1
@@ -143,7 +143,7 @@ test_profile_use_refuses_a_missing_generation() {
 
 test_profile_revert_marks_the_generation_before_latest() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 3 weeks ago\n3 sha256:c 2 weeks ago\n4 sha256:d 2 days ago\nlatest sha256:c 2 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 3 weeks ago\n3 sha256:c 2 weeks ago\n4 sha256:d 2 days ago\nlatest sha256:c 2 weeks ago\n'
   parse_arguments profile revert default
   capture run
   assert_status 0
@@ -153,7 +153,7 @@ test_profile_revert_marks_the_generation_before_latest() {
 
 test_profile_revert_fails_at_the_first_generation() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 3 weeks ago\nlatest sha256:a 3 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 3 weeks ago\nlatest sha256:a 3 weeks ago\n'
   parse_arguments profile revert default
   capture run
   assert_status 1
@@ -162,7 +162,7 @@ test_profile_revert_fails_at_the_first_generation() {
 
 test_ensuring_an_image_adopts_an_earlier_latest_without_building() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'latest sha256:old 3 months ago\n'
+  fake_images["dockered-claude-default"]=$'latest sha256:old 3 months ago\n'
   capture ensure_image
   assert_status 0
   assert_file "${calls}" 'docker tag sha256:old dockered-claude-default:1'
@@ -170,7 +170,7 @@ test_ensuring_an_image_adopts_an_earlier_latest_without_building() {
 
 test_ensuring_an_image_leaves_a_marked_generation_alone() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\nlatest sha256:a 2 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\nlatest sha256:a 2 weeks ago\n'
   capture ensure_image
   assert_status 0
   assert_file "${calls}" ''
@@ -178,7 +178,7 @@ test_ensuring_an_image_leaves_a_marked_generation_alone() {
 
 test_ensuring_an_image_refuses_generations_without_latest() {
   reset_profile_images
-  fake_images[dockered-claude-default]=$'1 sha256:a 2 weeks ago\n'
+  fake_images["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\n'
   capture ensure_image
   assert_status 1
   assert_contains "${errors}" "no generation of profile 'default' is marked latest"
@@ -299,8 +299,8 @@ test_profile_list_shows_the_generations_of_each_profile() {
   : >"${project_directory}/profiles/minimal/Dockerfile"
   : >"${project_directory}/profiles/old/Dockerfile"
   declare -gA fake_images=(
-    [dockered-claude-default]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:a 2 weeks ago\n'
-    [dockered-claude-old]=$'latest sha256:o 3 months ago\n'
+    ["dockered-claude-default"]=$'1 sha256:a 2 weeks ago\n2 sha256:b 2 days ago\nlatest sha256:a 2 weeks ago\n'
+    ["dockered-claude-old"]=$'latest sha256:o 3 months ago\n'
   )
   # shellcheck disable=SC2329 # Called by list_profiles.
   docker() { fake_profile_docker "$@"; }

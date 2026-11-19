@@ -201,6 +201,6 @@ test_pinned_tools_are_mounted_by_name() {
   select_mounted_tools
   assert_array mounted_tools uv rclone claude-code
   assert_equal 3 "${tool_pins[uv]}"
-  assert_equal 7 "${tool_pins[claude-code]}"
+  assert_equal 7 "${tool_pins["claude-code"]}"
   assert_equal '' "${tool_pins[rclone]:-}"
 }
