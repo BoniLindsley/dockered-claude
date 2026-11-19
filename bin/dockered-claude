@@ -43,12 +43,13 @@ Commands:
   tool build NAME...      Build or update each tool NAME from
                           tools/NAME/Dockerfile for that profile, as a new
                           generation of its volume
-  migrate                 Move Claude Code's state from where earlier
-                          versions kept it, STATE/home/USER/.claude and
-                          .claude.json, to STATE/tools/claude-code/.claude,
-                          where a run refuses to start until it is moved;
-                          refused while a container of the launcher runs,
-                          and never overwriting
+  migrate                 Move the state that earlier versions kept in
+                          STATE/home/USER: Claude Code's .claude and
+                          .claude.json to STATE/tools/claude-code/.claude,
+                          and the rest of that home to
+                          STATE/persists/home/USER; a run refuses to start
+                          until it is moved. Refused while a container of
+                          the launcher runs, and never overwriting
   clean TARGET...         Offer for removal, one item at a time, what the
                           launcher left unused; TARGET is one of:
                           containers  stopped containers left behind,
@@ -104,7 +105,8 @@ Environment:
                           project configuration gives one (default: default)
   DOCKERED_CLAUDE_HOME    Host state directory, STATE above (default:
                           \$XDG_STATE_HOME/dockered-claude or
-                          \$HOME/.local/state/dockered-claude); Claude Code's
+                          \$HOME/.local/state/dockered-claude), holding the
+                          persisted home paths (see Home); Claude Code's
                           ~/.claude is kept in STATE/tools/claude-code/.claude,
                           its configuration file in it as .claude.json
   DOCKERED_CLAUDE_TOOLS   Space-separated tools to use when neither --tool nor
@@ -123,6 +125,43 @@ Configuration:
   into the container's ~/.claude (e.g. settings.json), so the configuration
   is managed on the host while the rest of ~/.claude stays writable state.
   ~/.config/git is mounted read-only, so git uses the host's configuration.
+
+Home:
+  The container's home, /home/USER, comes from an image built for each
+  run on the profile's image, and removed after it, which adds the user
+  and the home directories. The container is read-only, so only these
+  paths of the home can be written, each mounted on its own:
+
+    ~/.cache              A tmpfs, emptied after each run.
+    Persisted paths       Kept in STATE across runs: those in the home file
+                          of each selected tool, tools/NAME/home, kept in
+                          STATE/tools/NAME; those that profile_home of the
+                          profile's launcher.bash prints, kept in
+                          STATE/profiles/PROFILE; and the user's persists =
+                          lines (see User configuration), kept in
+                          STATE/persists/home/USER, shared by all projects
+                          and profiles.
+
+  A persisted path is relative to ~, a file, or a directory with a
+  trailing / (e.g. .cache/uv/). One may be inside ~/.cache, mounted on top
+  of its tmpfs, but not ~/.cache itself. Persisted paths must not be at,
+  inside or above one another or the paths the launcher mounts, and the
+  working directory must not be at, inside or above one. What is missing
+  in STATE is created, empty, when a run starts.
+
+User configuration:
+  ~/.config/dockered-claude/config holds settings for all projects as
+  "KEY = VALUE" lines and # comments, each key given any number of times.
+  It is read as data and never run, and is mounted read-only in the
+  container when the working directory or a writable mount holds it.
+
+  mount = PATH[:rw]       A host path to mount in every project, as --mount
+                          takes it, relative to the host home. It is
+                          mounted even with --no-mounts and never saved; a
+                          path given or saved already keeps its mode, and
+                          a missing one is skipped with a warning.
+  persists = PATH         A home path to persist, shared by all projects
+                          and profiles (see Home); a leading ~/ is removed.
 
 Managed settings:
   A profile's managed-settings.json, and the user's
@@ -159,18 +198,23 @@ Project configuration:
                           directory holding .meta/)
 
 Mounts:
-  A mounted path appears at the same path in the container, after symbolic
-  links are resolved, so absolute paths keep working; --mount saves it
-  as given, made absolute, so that each run resolves its links again.
+  A mounted path appears at its resolved path in the container, and each
+  symbolic link met resolving it, the last component included, is made in
+  the run's image, so the path also works as given; --mount saves it as
+  given, made absolute, so that each run resolves its links again. A link
+  at, inside or above a path below, or at or above ~, is not made, with a
+  warning, and its mount goes ahead at the resolved path. A relative link
+  target through a directory missing in the container is kept, with a
+  warning.
   Like --tool, --mount replaces the saved mounts rather than
   adding to them, so give all of them, or use --no-save to mount paths for
   one run only. A saved mount whose path does not exist is skipped with a
   warning. Paths must not contain commas or double quotes.
 
-  A mount must not be at, inside or above Claude Code's state (~/.claude),
-  /opt/tools or system directories such as /usr and
-  /etc; nor at or inside ~/.agents, ~/.config/claude or ~/.config/git,
-  which the launcher mounts on top of a mount above them; nor be the
+  A mount must not be at, inside or above a persisted home path (such as
+  ~/.claude), /opt/tools or system directories such as /usr and /etc; nor
+  at or inside ~/.agents, ~/.config/claude or ~/.config/git, which the
+  launcher mounts on top of a mount above them; nor be ~/.cache, the
   working directory or inside .meta/dockered-claude. A project
   configuration that a writable mount (or the working directory) would
   expose stays read-only: this project's, and one at the root of a
@@ -221,6 +265,8 @@ Profiles:
                           saved already keeps its mode.
     profile_path          Absolute directories to put in front of the
                           image's PATH, in order, after the tools' bin/.
+    profile_home          Home paths to persist (see Home), kept for the
+                          profile, after those of the tools.
 
   An error in the script or in a function stops the launch. What the script
   prints on standard output is read as items too, so messages belong on
@@ -269,6 +315,10 @@ Tools:
   container uses, which can be removed with: ${script_name} clean tools. Volumes named
   dockered-claude-tool-NAME, from earlier versions of the launcher, are no
   longer used.
+
+  A tool may have a home file in its directory, home, listing the home
+  paths it persists (see Home), one per line, with blank lines and #
+  comments; they are mounted only when the tool is selected.
 
   The tool claude-code, Claude Code itself, is always mounted, even with
   --no-tools, and its bin/ goes last on PATH, after the image's. Claude
