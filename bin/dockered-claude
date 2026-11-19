@@ -748,6 +748,23 @@ resolve_mount_spec() {
   mount_path="$(realpath -m -- "${mount_path}")" || return
 }
 
+# Set hidden_paths to the paths that the image needs
+# or that hold Claude Code's state in the persisted home,
+# and mounted_paths to those the launcher mounts itself.
+set_reserved_paths() {
+  hidden_paths=(
+    /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /opt/tools /proc /run
+    /sbin /sys /tmp /usr /var
+    "${home}/.claude"
+    "${home}/.claude.json"
+  )
+  mounted_paths=(
+    "${home}/.agents"
+    "${home}/.config/claude"
+    "${home}/.config/git"
+  )
+}
+
 # Refuse a mount at, inside or above a path that the image needs
 # or that holds Claude Code's state in the persisted home,
 # since it would hide or replace them;
@@ -759,17 +776,8 @@ resolve_mount_spec() {
 # which must stay read-only in the container.
 check_mount_path() {
   declare path="$1" reserved
-  declare -a hidden_paths=(
-    /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /opt/tools /proc /run
-    /sbin /sys /tmp /usr /var
-    "${home}/.claude"
-    "${home}/.claude.json"
-  )
-  declare -a mounted_paths=(
-    "${home}/.agents"
-    "${home}/.config/claude"
-    "${home}/.config/git"
-  )
+  declare -a hidden_paths mounted_paths
+  set_reserved_paths
   for reserved in "${hidden_paths[@]}" "${mounted_paths[@]}"; do
     if [[ "${path}" == "${reserved}" || "${path}" == "${reserved}/"* ]]; then
       warn "cannot mount '${path}': it would replace ${reserved}"
