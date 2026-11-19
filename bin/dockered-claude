@@ -175,7 +175,7 @@ parse_arguments() {
     ;;
   tool)
     shift
-    parse_tool_arguments "$@" || return
+    parse_group_arguments tool "$@" || return
     ;;
   -*)
     kwargs[command]=run
@@ -283,40 +283,43 @@ parse_no_arguments() {
   done
 }
 
-# Set kwargs[command] to tool-list or tool-build,
-# and args to the names of the tools to build.
-parse_tool_arguments() {
-  declare argument
+# Set kwargs[command] to GROUP-list or GROUP-build,
+# and args to the names to build,
+# for the commands GROUP list and GROUP build NAME...,
+# where GROUP names its validate_GROUP_name function.
+parse_group_arguments() {
+  declare group="$1" argument
+  shift
   case "${1:-}" in
   -h | --help) kwargs[help]=1 ;;
   list)
-    kwargs[command]='tool-list'
+    kwargs[command]="${group}-list"
     shift
-    parse_no_arguments 'tool list' "$@" || return
+    parse_no_arguments "${group} list" "$@" || return
     ;;
   build)
-    kwargs[command]='tool-build'
+    kwargs[command]="${group}-build"
     shift
     for argument in "$@"; do
       case "${argument}" in
       -h | --help) kwargs[help]=1 ;;
       *)
-        validate_tool_name "${argument}" || return
+        "validate_${group}_name" "${argument}" || return
         args+=("${argument}")
         ;;
       esac
     done
     if ((${#args[@]} == 0)) && [[ -z "${kwargs[help]+defined}" ]]; then
-      warn "tool build requires a tool name"
+      warn "${group} build requires a ${group} name"
       return 1
     fi
     ;;
   '')
-    warn "tool requires list or build"
+    warn "${group} requires list or build"
     return 1
     ;;
   *)
-    warn "unknown tool command '$1'"
+    warn "unknown ${group} command '$1'"
     return 1
     ;;
   esac
