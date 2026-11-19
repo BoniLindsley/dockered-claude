@@ -278,8 +278,9 @@ Tools:
 
   A tool may also have an env file in its directory, in docker's --env-file
   format, to set variables it needs (e.g. VCPKG_ROOT=/opt/tools/vcpkg/root).
-  It must not set PATH. The first tool selected wins on name collisions here
-  too.
+  A value starting with ~/ is expanded to the container's home (e.g.
+  VCPKG_DOWNLOADS=~/.cache/vcpkg/downloads). It must not set PATH. The
+  first tool selected wins on name collisions here too.
 
 Examples:
   ${script_name}
@@ -2238,10 +2239,15 @@ add_base_arguments() {
 # A tool's env file, if any, is passed with --env-file.
 # Later files override earlier ones,
 # so they are passed in reverse order to let the first tool win.
+# Docker does not expand values,
+# so a value starting with ~/ is also passed with --env,
+# expanded to the container's home,
+# unless an earlier tool sets the variable;
+# --env overrides every --env-file.
 add_tool_arguments() {
-  declare env_file tool
-  declare -a env_args=()
-  declare -A seen=()
+  declare env_file tool name
+  declare -a env_args=() home_env_args=() file_names=()
+  declare -A seen=() env_names=() file_values=()
 
   for tool in "${mounted_tools[@]}"; do
     [[ -z "${seen[${tool}]+defined}" ]] || continue
@@ -2259,13 +2265,47 @@ add_tool_arguments() {
         return 1
       fi
       env_args=(--env-file "${env_file}" "${env_args[@]}")
+      read_env_file "${env_file}" || return
+      for name in "${file_names[@]}"; do
+        [[ -z "${env_names[${name}]+defined}" ]] || continue
+        env_names[${name}]=1
+        [[ -n "${file_values[${name}]}" ]] || continue
+        home_env_args+=(--env "${name}=${file_values[${name}]}")
+      done
     fi
     docker_args+=(
       --mount "type=volume,src=${tool_volume_names[${tool}]},dst=/opt/tools/${tool},readonly"
     )
   done
 
-  docker_args+=("${env_args[@]}")
+  docker_args+=("${env_args[@]}" "${home_env_args[@]}")
+}
+
+# Set file_names to the variables ENV_FILE sets, in order,
+# and file_values, for each, to its value expanded to the container's home
+# if the last line setting it starts its value with ~/, or else empty.
+# Lines are read as docker reads them:
+# blank lines and comments are skipped,
+# and a name without = passes the host's variable.
+read_env_file() {
+  declare env_file="$1" line name value
+  file_names=()
+  file_values=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "${line}" && "${line}" != '#'* ]] || continue
+    name="${line%%=*}"
+    # Docker refuses a line without a name.
+    [[ -n "${name}" ]] || continue
+    value="${line#"${name}"}"
+    if [[ "${value}" == '=~/'* ]]; then
+      value="${home}/${value#'=~/'}"
+    else
+      value=
+    fi
+    [[ -n "${file_values[${name}]+defined}" ]] || file_names+=("${name}")
+    file_values[${name}]="${value}"
+  done <"${env_file}"
 }
 
 # Mount the profile's managed-settings.json, if it has one,

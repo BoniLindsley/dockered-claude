@@ -21,6 +21,7 @@ reset_container() {
     ["claude-code"]=dockered-claude-tool-default-claude-code-2.1.328
   )
   project_directory="${temporary_directory}/launcher"
+  home=/home/claude
   container_image=dockered-claude-default:latest
   mkdir -p -- "${project_directory}"/tools/{rclone,uv,claude-code}
   : >"${project_directory}/tools/claude-code/Dockerfile"
@@ -46,6 +47,40 @@ test_tools_go_in_front_of_the_image_path_in_order() {
     --mount type=volume,src=dockered-claude-tool-default-rclone-1,dst=/opt/tools/rclone,readonly \
     --env-file "${project_directory}/tools/uv/env" \
     --env PATH=/opt/tools/uv/bin:/opt/tools/rclone/bin:/usr/local/bin:/usr/bin
+}
+
+test_env_values_starting_with_a_tilde_are_expanded_to_the_home() {
+  reset_container
+  mounted_tools=(uv)
+  printf '%s\n' \
+    '# UV_A=~/comment' '' \
+    ' UV_CACHE_DIR=~/.cache/uv' \
+    'UV_TOOL=~' 'UV_PLAIN=a~/b' 'UV_HOST' 'UV_LAST=~/first' \
+    >"${project_directory}/tools/uv/env"
+  printf '%s' 'UV_LAST=/last' >>"${project_directory}/tools/uv/env"
+  capture add_tool_arguments
+  assert_status 0
+  assert_array docker_args \
+    --mount type=volume,src=dockered-claude-tool-default-uv-2,dst=/opt/tools/uv,readonly \
+    --env-file "${project_directory}/tools/uv/env" \
+    --env UV_CACHE_DIR=/home/claude/.cache/uv
+}
+
+test_an_expanded_env_value_of_a_later_tool_does_not_win() {
+  reset_container
+  mounted_tools=(uv rclone)
+  printf '%s\n' 'SHARED=/uv' 'FIRST=~/uv' >"${project_directory}/tools/uv/env"
+  printf '%s\n' 'SHARED=~/rclone' 'FIRST=~/rclone' 'SECOND=~/rclone' \
+    >"${project_directory}/tools/rclone/env"
+  capture add_tool_arguments
+  assert_status 0
+  assert_array docker_args \
+    --mount type=volume,src=dockered-claude-tool-default-uv-2,dst=/opt/tools/uv,readonly \
+    --mount type=volume,src=dockered-claude-tool-default-rclone-1,dst=/opt/tools/rclone,readonly \
+    --env-file "${project_directory}/tools/rclone/env" \
+    --env-file "${project_directory}/tools/uv/env" \
+    --env FIRST=/home/claude/uv \
+    --env SECOND=/home/claude/rclone
 }
 
 test_without_path_entries_the_image_path_is_kept() {
