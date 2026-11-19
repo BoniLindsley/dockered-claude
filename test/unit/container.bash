@@ -125,6 +125,7 @@ reset_managed_settings() {
   declare -gA mount_modes=()
   project_config="${workdir}/${project_config_path}"
   state_dir="${temporary_directory}/state"
+  claude_state="${state_dir}/tools/claude-code/.claude"
   home="${HOME}"
   agents_dir="${HOME}/.agents"
   config_dir="${HOME}/.config/claude"
@@ -322,4 +323,13 @@ drwxr-xr-x 1000/1001 ${home#/}/a/b/
 lrwxrwxrwx 0/0 ${home#/}/src -> /data/src
 lrwxrwxrwx 0/0 1/2 -> /b
 lrwxrwxrwx 0/0 ${home#/}/a/b/c -> ../../x" "$(sed 1,3d -- "${build}")"
+}
+
+test_claude_codes_state_is_mounted_from_the_tools_state() {
+  reset_managed_settings
+  capture_run_container
+  assert_status 0
+  assert_contains "${output}" "CLAUDE_CONFIG_DIR=${home}/.claude"
+  assert_contains "${output}" \
+    "type=bind,src=${claude_state},dst=${home}/.claude"
 }
