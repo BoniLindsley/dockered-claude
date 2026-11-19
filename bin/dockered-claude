@@ -1377,6 +1377,16 @@ add_path_argument() {
   docker_args+=(--env "PATH=${entries:+${entries}:}${image_path}${suffix:+:${suffix}}")
 }
 
+# Print, one per line, the volumes of TOOL for the profile
+# that hold VERSION.
+find_version_volumes() {
+  declare tool="$1" version="$2"
+  docker volume ls --quiet \
+    --filter "label=dockered-claude.tool=${tool}" \
+    --filter "label=dockered-claude.profile=${profile}" \
+    --filter "label=dockered-claude.version=${version}"
+}
+
 # Build tools/TOOL/Dockerfile on the profile's image
 # and copy the prefix it holds, /opt/tools/TOOL,
 # into a new volume, the next generation of the tool for the profile.
@@ -1420,10 +1430,7 @@ build_tool_volume() {
       generation=$((tool_generations[-1] + 1))
     volume="dockered-claude-tool-${profile}-${tool}-${tool_version:-${generation}}"
     if [[ -n "${tool_version}" ]] &&
-      existing="$(docker volume ls --quiet \
-        --filter "label=dockered-claude.tool=${tool}" \
-        --filter "label=dockered-claude.profile=${profile}" \
-        --filter "label=dockered-claude.version=${tool_version}")" &&
+      existing="$(find_version_volumes "${tool}" "${tool_version}")" &&
       [[ -n "${existing}" ]]; then
       docker image rm "${tool_image}" >/dev/null || return
       warn "tool '${tool}' ${tool_version} for profile '${profile}'" \
