@@ -162,17 +162,18 @@ test_packages_says_how_each_image_stands() {
   reset_clean
   kwargs[dry_run]=1
   args=(packages)
-  fake_packages_listing=$'sha256:p1 dockered-claude-default:packages-aaa\nsha256:p2 dockered-claude-default:packages-bbb\nsha256:p3 <none>:<none>\nsha256:p4 dockered-claude-gone:packages-ccc\nsha256:p5 dockered-claude-default:packages-ddd\n'
+  fake_packages_listing=$'sha256:p1 dockered-claude-default:packages-aaa\nsha256:p2 dockered-claude-default:packages-bbb\nsha256:p3 <none>:<none>\nsha256:p4 dockered-claude-gone:packages-ccc\nsha256:p5 dockered-claude-default:packages-ddd\nsha256:p6 dockered-claude-default:packages-eee-2\n'
   fake_image_labels["sha256:p1"]='sha256:base|gdb'
   fake_image_labels["sha256:p2"]='sha256:old|gdb strace'
   fake_image_labels["sha256:p3"]='sha256:old|gdb'
   fake_image_labels["sha256:p4"]='|curl'
+  fake_image_labels["sha256:p6"]='sha256:two|gdb'
   fake_users_of["ancestor=sha256:p5"]=container
   fake_current_image=sha256:base
   capture clean_unused
   assert_status 0
   assert_equal \
-    $'image dockered-claude-default:packages-aaa: packages gdb; current for profile \'default\'\nimage dockered-claude-default:packages-bbb: packages gdb strace; built from an older image of profile \'default\'\nimage sha256:p3: packages gdb; replaced by a later build\nimage dockered-claude-gone:packages-ccc: packages curl; profile \'gone\' is no longer defined' \
+    $'image dockered-claude-default:packages-aaa: packages gdb; current for profile \'default\'\nimage dockered-claude-default:packages-bbb: packages gdb strace; built from an older image of profile \'default\'\nimage sha256:p3: packages gdb; replaced by a later build\nimage dockered-claude-gone:packages-ccc: packages curl; profile \'gone\' is no longer defined\nimage dockered-claude-default:packages-eee-2: packages gdb; built from generation 2 of profile \'default\', not the latest' \
     "${output}"
 }
 

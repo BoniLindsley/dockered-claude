@@ -156,14 +156,16 @@ Mounts:
   writable mount. Others deeper inside a writable mount are not looked for.
 
   Packages are installed in an image derived from the profile's image,
-  tagged by a hash of the sorted package names (as in
-  dockered-claude-default:packages-3f9a1c2b4d5e), so projects with the
-  same profile and packages share it. It is built from the profile's own
-  Dockerfile.packages when it has one, else from the launcher's. It is
-  rebuilt with build and whenever the profile's image has changed. Remove
-  unused ones with: ${script_name} clean packages
-  (they are rebuilt when next needed). Tools are built on the profile's
-  image, without the packages, since they are shared between projects.
+  tagged by a hash of the sorted package names and the generation of the
+  profile's image (as in dockered-claude-default:packages-3f9a1c2b4d5e-2),
+  so projects with the same profile and packages share it, and marking an
+  earlier generation latest uses its packages image again if it was kept.
+  It is built from the profile's own Dockerfile.packages when it has one,
+  else from the launcher's. It is rebuilt with build and whenever the
+  profile's image has changed. Remove unused ones with:
+  ${script_name} clean packages (they are rebuilt when next needed).
+  Tools are built on the profile's image, without the packages, since
+  they are shared between projects.
 
 Profiles:
   Each profile is a directory profiles/NAME next to the launcher's bin/,
@@ -1562,22 +1564,34 @@ revert_profile() {
 # Run containers from an image with the selected packages
 # on top of the base image,
 # tagged by a hash of their sorted names
-# so that projects with the same packages share it.
+# so that projects with the same packages share it,
+# and by the generation of the base image,
+# so that marking an earlier generation latest finds its packages image.
 # Build it with the build command, when it is missing,
 # or when it was built from another base image,
 # from the profile's own Dockerfile.packages if it has one.
 ensure_packages_image() {
   ((${#packages[@]} > 0)) || return 0
   declare repository="${image}" names hash base_id built_from
+  declare latest_id generation
+  declare -a profile_generations
+  declare -A generation_ids generation_ages
   declare file="${project_directory}/profiles/${profile}/Dockerfile.packages"
   [[ -f "${file}" ]] || file="${project_directory}/Dockerfile.packages"
   # Drop the tag, but not a registry port (e.g. host:5000/name).
   [[ "${repository##*/}" != *:* ]] || repository="${repository%:*}"
   names="$(printf '%s\n' "${packages[@]}" | sort -u | paste -s -d ' ')" || return
   hash="$(printf '%s\n' "${names}" | sha256sum)" || return
-  container_image="${repository}:packages-${hash:0:12}"
 
   base_id="$(docker image inspect --format '{{.Id}}' "${image}")" || return
+  find_profile_generations || return
+  find_generation_of "${base_id}"
+  if [[ -z "${generation}" ]]; then
+    warn "the latest image of profile '${profile}' is no generation;" \
+      "rebuild it with: ${script_name} profile build ${profile}"
+    return 1
+  fi
+  container_image="${repository}:packages-${hash:0:12}-${generation}"
   if [[ "${kwargs[command]}" != build ]] &&
     built_from="$(docker image inspect \
       --format '{{index .Config.Labels "dockered-claude.base-image"}}' \
@@ -2164,6 +2178,9 @@ find_unused_packages() {
       "${repository}:latest" 2>/dev/null)" &&
       [[ "${current}" == "${base_image}" ]]; then
       reason="current for profile '${name}'"
+    elif [[ "${reference}" =~ :packages-[0-9a-f]+-([1-9][0-9]*)$ ]]; then
+      reason="built from generation ${BASH_REMATCH[1]} of profile '${name}'"
+      reason+=", not the latest"
     else
       reason="built from an older image of profile '${name}'"
     fi

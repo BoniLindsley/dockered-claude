@@ -241,6 +241,7 @@ test_build_rebuilds_the_image_and_the_saved_packages() {
 docker_with_current_packages_image() {
   case "$*" in
   'image inspect --format {{.Id}} '*) printf 'sha256:base\n' ;;
+  'image ls '*) printf 'latest sha256:base now\n1 sha256:base now\n' ;;
   'image inspect --format {{index .Config.Labels '*) printf 'sha256:base\n' ;;
   build\ *) printf 'docker build\n' >>"${calls}" ;;
   *) return 1 ;;
@@ -258,6 +259,8 @@ test_running_keeps_a_current_packages_image() {
   assert_status 0
   assert_file "${calls}" ''
   assert_contains "${container_image}" 'dockered-claude-default:packages-'
+  [[ "${container_image}" == *-1 ]] ||
+    fail "expected the generation in the tag: ${container_image}"
 }
 
 test_build_rebuilds_a_current_packages_image() {
@@ -380,6 +383,7 @@ test_packages_use_the_profile_dockerfile_when_it_has_one() {
   docker() {
     case "$*" in
     'image inspect --format {{.Id}} '*) printf 'sha256:base\n' ;;
+    'image ls '*) printf 'latest sha256:base now\n1 sha256:base now\n' ;;
     build\ *) printf '%s\n' "$*" >>"${calls}" ;;
     *) return 1 ;;
     esac
@@ -400,6 +404,7 @@ test_packages_use_the_launcher_dockerfile_otherwise() {
   docker() {
     case "$*" in
     'image inspect --format {{.Id}} '*) printf 'sha256:base\n' ;;
+    'image ls '*) printf 'latest sha256:base now\n1 sha256:base now\n' ;;
     build\ *) printf '%s\n' "$*" >>"${calls}" ;;
     *) return 1 ;;
     esac
