@@ -70,11 +70,6 @@ RUN : \
 
 ENV HOME=/home/claude
 
-# Claude Code is the launcher's claude-code tool, mounted from a read-only
-# volume, so it cannot update itself.
-# Update it with: dockered-claude tool build claude-code
-ENV DISABLE_AUTOUPDATER=1
-
 # The image itself is non-root even when invoked without the wrapper.
 # The launcher overrides this with the invoking host user's UID/GID.
 USER 65532:65532
