@@ -149,7 +149,8 @@ Project configuration:
 Mounts:
   A mounted path appears at the same path in the container, after symbolic
   links are resolved, so absolute paths keep working; --mount saves it
-  that way. Like --tool, --mount replaces the saved mounts rather than
+  as given, made absolute, so that each run resolves its links again.
+  Like --tool, --mount replaces the saved mounts rather than
   adding to them, so give all of them, or use --no-save to mount paths for
   one run only. A saved mount whose path does not exist is skipped with a
   warning. Paths must not contain commas or double quotes.
@@ -738,14 +739,135 @@ validate_mount_spec() {
   fi
 }
 
-# Set mount_path to the absolute path of a mount given as PATH[:ro|:rw],
-# relative PATHs resolved against base and symbolic links resolved,
+# Set mount_given to a mount given as PATH[:ro|:rw] as normalize_path makes it,
+# a relative PATH made absolute against BASE,
+# mount_path to it with symbolic links resolved,
 # and mount_mode to its mode.
 resolve_mount_spec() {
-  declare spec="$1" base="$2"
+  declare spec="$1" base="$2" normalized_path
   split_mount_spec "${spec}"
   [[ "${mount_path}" == /* ]] || mount_path="${base}/${mount_path}"
-  mount_path="$(realpath -m -- "${mount_path}")" || return
+  normalize_path "${mount_path}"
+  mount_given="${normalized_path}"
+  mount_path="$(realpath -m -- "${mount_given}")" || return
+}
+
+# Set normalized_path to the absolute PATH
+# without empty and . components,
+# and without each .. and the component before it
+# when that one is not a symbolic link,
+# since dropping both does not change where the path leads.
+normalize_path() {
+  declare path="$1" component
+  declare -a components
+  normalized_path=''
+  IFS=/ read -r -a components <<<"${path}"
+  for component in "${components[@]}"; do
+    case "${component}" in
+    '' | .) continue ;;
+    ..)
+      # At the root, .. leads to the root.
+      [[ -n "${normalized_path}" ]] || continue
+      if [[ "${normalized_path##*/}" != .. && ! -L "${normalized_path}" ]]; then
+        normalized_path="${normalized_path%/*}"
+        continue
+      fi
+      ;;
+    esac
+    normalized_path+="/${component}"
+  done
+  [[ -n "${normalized_path}" ]] || normalized_path=/
+}
+
+# Set traced_path to the absolute PATH with its symbolic links resolved,
+# as realpath -m resolves them,
+# adding each link met to link_paths, in order,
+# and its target, as written, to link_targets, by the link's path,
+# so that the container can have the same links;
+# links inside a target are met and added too.
+# Each directory that a .. leaves is added to link_climbs,
+# with PATH, for warn_missing_climbed_directories.
+# Fail after 40 links, as Linux does,
+# or at a target that is empty or holds a newline.
+trace_links() {
+  declare path="$1" resolved='' component link target
+  declare -a pending target_components
+  declare -i followed=0
+  IFS=/ read -r -a pending <<<"${path}"
+  while ((${#pending[@]} > 0)); do
+    component="${pending[0]}"
+    pending=("${pending[@]:1}")
+    case "${component}" in
+    '' | .) continue ;;
+    ..)
+      if [[ -n "${resolved}" ]]; then
+        link_climbs["${resolved}"]="${path}"
+        resolved="${resolved%/*}"
+      fi
+      continue
+      ;;
+    esac
+    link="${resolved}/${component}"
+    if [[ ! -L "${link}" ]]; then
+      resolved="${link}"
+      continue
+    fi
+    followed+=1
+    if ((followed > 40)); then
+      warn "cannot resolve '${path}': more than 40 symbolic links"
+      return 1
+    fi
+    target="$(readlink -- "${link}")" || return
+    if [[ -z "${target}" || "${target}" == *$'\n'* ]]; then
+      warn "cannot resolve '${path}': the symbolic link '${link}'" \
+        "has an empty target or one with a newline"
+      return 1
+    fi
+    if [[ -z "${link_targets["${link}"]+defined}" ]]; then
+      link_paths+=("${link}")
+      link_targets["${link}"]="${target}"
+    fi
+    # A relative target is relative to the link's directory, resolved.
+    [[ "${target}" != /* ]] || resolved=''
+    IFS=/ read -r -a target_components <<<"${target}"
+    pending=("${target_components[@]}" "${pending[@]}")
+  done
+  traced_path="${resolved:-/}"
+}
+
+# Trace the links of the working directory as the shell names it, in PWD,
+# when that leads to workdir;
+# otherwise PWD is stale or unset, and only workdir is known.
+trace_working_directory() {
+  declare resolved traced_path
+  [[ "${PWD:-}" == /* ]] || return 0
+  resolved="$(realpath -m -- "${PWD}")" || return
+  [[ "${resolved}" == "${workdir}" ]] || return 0
+  trace_links "${PWD}" || return
+}
+
+# Warn about each directory in link_climbs
+# that the container will not have, since it is neither
+# at, inside or above a mount, the working directory included,
+# nor above a link:
+# the path that leaves it with .. may then not lead there in the container.
+# Such a link target is kept as written all the same (D16 of the design).
+warn_missing_climbed_directories() {
+  declare directory path link
+  for directory in "${!link_climbs[@]}"; do
+    for path in "${workdir}" "${mount_paths[@]}"; do
+      if [[ "${directory}" == "${path}" || "${directory}" == "${path}/"* ||
+        "${path}" == "${directory}/"* ]]; then
+        continue 2
+      fi
+    done
+    for link in "${link_paths[@]}"; do
+      [[ "${link}" != "${directory}/"* ]] || continue 2
+    done
+    warn "'${link_climbs["${directory}"]}' leaves '${directory}' with '..'," \
+      "but the container will not have that directory," \
+      "so the path may not work there as it does on the host"
+  done
 }
 
 # Set hidden_paths to the paths that the image needs
@@ -808,7 +930,7 @@ check_mount_path() {
 # those given with --mount and --no-mounts,
 # else those saved in project_mounts that still exist.
 select_mounts() {
-  declare spec mount_path mount_mode
+  declare spec mount_path mount_mode mount_given
 
   if [[ -z "${kwargs[mounts_given]+defined}" ]]; then
     for spec in "${project_mounts[@]}"; do
@@ -833,12 +955,18 @@ select_mounts() {
 }
 
 # Add mount_path with mount_mode to mount_paths and mount_modes,
-# replacing the mode of an earlier mount of the same path.
+# and mount_given to mount_given_paths,
+# replacing the mode and given path of an earlier mount of the same path,
+# and add the links met resolving mount_given, as trace_links does.
 add_mount() {
+  # shellcheck disable=SC2034 # Set by trace_links; mount_path has it already.
+  declare traced_path
   check_mount_path "${mount_path}" || return
+  trace_links "${mount_given}" || return
   [[ -n "${mount_modes[${mount_path}]+defined}" ]] ||
     mount_paths+=("${mount_path}")
   mount_modes[${mount_path}]="${mount_mode}"
+  mount_given_paths[${mount_path}]="${mount_given}"
 }
 
 # Print what FUNCTION of the profile's launcher.bash prints,
@@ -881,7 +1009,7 @@ read_profile_function() {
 # and set profile_path_entries to the directories for PATH.
 read_profile_launcher() {
   declare script="${project_directory}/profiles/${profile}/launcher.bash"
-  declare line mount_path mount_mode
+  declare line mount_path mount_mode mount_given
   declare -a lines
 
   read_profile_function profile_environment || return
@@ -1227,7 +1355,8 @@ save_project_option() {
 
 # Save the mounts in mount_paths, given with --mount or --no-mounts,
 # except those of the profile, in profile_mount_paths,
-# as "mount = PATH[:rw]" lines with their absolute paths
+# as "mount = PATH[:rw]" lines with their paths as given,
+# made absolute, from mount_given_paths,
 # if they differ from the saved ones,
 # replacing all mount lines where the first one was
 # (or else at the end) and keeping every other line, and say so.
@@ -1238,7 +1367,7 @@ save_project_mounts() {
 
   for mount_path in "${mount_paths[@]}"; do
     [[ -z "${profile_mount_paths[${mount_path}]+defined}" ]] || continue
-    line="mount = ${mount_path}"
+    line="mount = ${mount_given_paths[${mount_path}]:-${mount_path}}"
     [[ "${mount_modes[${mount_path}]}" == ro ]] || line+=":rw"
     settings+=("${line}")
   done
@@ -2399,7 +2528,8 @@ run() {
   declare -a profile_variables=() profile_path_entries=()
   declare -A project_options=() mount_modes=() profile_mount_paths=()
   declare -A tool_volume_names=() tool_pins=()
-  declare -a mounted_tools=()
+  declare -a mounted_tools=() link_paths=()
+  declare -A link_targets=() link_climbs=() mount_given_paths=()
 
   declare name
 
@@ -2460,8 +2590,10 @@ run() {
   select_tools || return
   select_mounted_tools
   select_packages || return
+  trace_working_directory || return
   select_mounts || return
   read_profile_launcher || return
+  warn_missing_climbed_directories
   prepare_mount_points || return
   prepare_user_identity || return
   link_agent_skills || return

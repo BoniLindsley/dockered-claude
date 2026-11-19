@@ -79,6 +79,8 @@ test_selecting_refuses_an_invalid_name_from_the_environment() {
 reset_launcher() {
   reset_profiles
   declare -gA mount_modes=() profile_mount_paths=()
+  declare -gA mount_given_paths=() link_targets=() link_climbs=()
+  declare -ga link_paths=()
   declare -ga mount_paths=() profile_variables=() profile_path_entries=()
   set_profile default
   home=/home/claude
