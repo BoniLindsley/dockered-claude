@@ -174,3 +174,30 @@ test_finding_falls_back_to_the_main_worktree() {
   assert_equal "${temporary_directory}/repository/${project_config_path}" \
     "${project_config}"
 }
+
+test_reading_keeps_the_profile() {
+  reset_configuration
+  write_config 'profile = minimal'
+  capture read_project_config
+  assert_status 0
+  assert_equal minimal "${project_options[profile]}"
+}
+
+test_saving_keeps_a_given_profile() {
+  reset_configuration
+  kwargs[profile]=minimal
+  capture save_project_options
+  assert_status 0
+  assert_file "${project_config}" \
+    "# dockered-claude options for this project, saved from the command line
+# (see dockered-claude --help).
+profile = minimal"
+}
+
+test_saving_nothing_without_a_given_profile() {
+  reset_configuration
+  project_options[profile]=minimal
+  capture save_project_options
+  assert_status 0
+  [[ ! -e "${project_config}" ]] || fail "expected no file: ${project_config}"
+}

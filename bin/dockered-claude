@@ -2,11 +2,14 @@
 
 __help() {
   cat <<HELP
-Usage: ${script_name} [run] [--tool NAME | --no-tools]...
+Usage: ${script_name} [run] [--profile NAME]
+                         [--tool NAME | --no-tools]...
                          [--package NAME | --no-packages]...
                          [--mount PATH[:rw] | --no-mounts]... [--no-save]
                          [--] [claude arguments...]
        ${script_name} build
+       ${script_name} profile list
+       ${script_name} profile build NAME...
        ${script_name} tool list
        ${script_name} tool build NAME...
        ${script_name} --help
@@ -19,15 +22,19 @@ Commands:
                           argument that is not one of the options below,
                           and every argument after it, go to Claude Code,
                           so a prompt is given as: run 'PROMPT'
-  build                   Rebuild the Docker image, and the packages image
-                          of the project's packages (also how Claude Code
-                          gets updated)
+  build                   Rebuild the image of the project's profile, and
+                          the packages image of the project's packages
+                          (also how Claude Code gets updated)
+  profile list            List the profiles and whether each is built
+  profile build NAME...   Build or update the image of each profile NAME
+                          from profiles/NAME/Dockerfile
   tool list               List the tools and whether each is built
   tool build NAME...      Build or update each tool NAME from
                           tools/NAME/Dockerfile, replacing its volume
 
 Options of run:
   -h, --help              Show this help (also after any command)
+  --profile NAME          Use profile NAME (saved for the project)
   -t, --tool NAME         Make tool NAME available (repeatable; saved for the
                           project)
   --no-tools              Make no tools available (saved for the project)
@@ -42,7 +49,8 @@ Options of run:
   --                      Pass remaining arguments directly to Claude Code
 
 Environment:
-  DOCKERED_CLAUDE_IMAGE   Image name (default: dockered-claude:latest)
+  DOCKERED_CLAUDE_PROFILE Profile to use when neither --profile nor the
+                          project configuration gives one (default: default)
   DOCKERED_CLAUDE_HOME    Host state directory (default: \$XDG_STATE_HOME/dockered-claude
                           or \$HOME/.local/state/dockered-claude)
   DOCKERED_CLAUDE_TOOLS   Space-separated tools to use when neither --tool nor
@@ -68,8 +76,8 @@ Project configuration:
   in the working directory and its parents below \$HOME, then in the main
   worktree of the git repository.
 
-  --tool, --no-tools, --package, --no-packages, --mount and --no-mounts
-  are saved to it, replacing the line for their key (all mount lines, for
+  --profile, --tool, --no-tools, --package, --no-packages, --mount and
+  --no-mounts are saved to it, replacing the line for their key (all mount lines, for
   mounts) and keeping all other lines; packages are saved only once their
   image has been built. When there is no file
   yet, it is created in the main worktree, or else in the working
@@ -78,6 +86,7 @@ Project configuration:
   since the launcher reads it on the host. Tool builds (tool build)
   neither read nor save it.
 
+  profile = NAME          Profile to use when no --profile is given
   tools = NAME...         Tools to use when no --tool is given
   packages = NAME...      Debian packages to add when no --package is given
   mount = PATH[:rw]       A path to mount when no --mount is given,
@@ -102,14 +111,27 @@ Mounts:
   expose stays read-only: this project's, and one at the root of a
   writable mount. Others deeper inside a writable mount are not looked for.
 
-  Packages are installed in an image derived from the base image, tagged
-  by a hash of the sorted package names (as in
-  dockered-claude:packages-3f9a1c2b4d5e), so projects with the same
-  packages share it. It is rebuilt with build and whenever the base
-  image has changed. Remove unused ones with:
+  Packages are installed in an image derived from the profile's image,
+  tagged by a hash of the sorted package names (as in
+  dockered-claude-default:packages-3f9a1c2b4d5e), so projects with the
+  same profile and packages share it. It is built from the profile's own
+  Dockerfile.packages when it has one, else from the launcher's. It is
+  rebuilt with build and whenever the profile's image has changed. Remove
+  unused ones with:
   docker image prune --all --filter label=dockered-claude.packages
-  (they are rebuilt when next needed). Tools are built on the base image,
-  since they are shared between projects.
+  (they are rebuilt when next needed). Tools are built on a profile's
+  image, without the packages, since they are shared between projects:
+  on the project's profile when a run builds a missing tool, and on that
+  of DOCKERED_CLAUDE_PROFILE with tool build. Their volumes are shared
+  between profiles too.
+
+Profiles:
+  Each profile is a directory profiles/NAME next to the launcher's bin/,
+  holding a Dockerfile and anything it needs, which is built with that
+  directory as its context into the image dockered-claude-NAME:latest.
+  The image must provide what Claude Code and the tools need, as
+  profiles/default does. A selected profile whose image is missing is
+  built before Claude Code starts.
 
 Tools:
   Each tool is a directory tools/NAME next to the launcher's bin/, holding
@@ -139,6 +161,7 @@ Tools:
 Examples:
   ${script_name}
   ${script_name} build
+  ${script_name} profile build default
   ${script_name} run -- --help
   ${script_name} -p 'run the tests'
   ${script_name} run 'fix the failing test'
@@ -173,6 +196,10 @@ parse_arguments() {
     shift
     parse_no_arguments build "$@" || return
     ;;
+  profile)
+    shift
+    parse_group_arguments profile "$@" || return
+    ;;
   tool)
     shift
     parse_group_arguments tool "$@" || return
@@ -199,6 +226,15 @@ parse_run_arguments() {
     shift
     case "${argument}" in
     -h | --help) kwargs[help]=1 ;;
+    --profile)
+      if (($# == 0)); then
+        warn "${argument} requires a profile name"
+        return 1
+      fi
+      validate_profile_name "$1" || return
+      kwargs[profile]="$1"
+      shift
+      ;;
     -t | --tool)
       if (($# == 0)); then
         warn "${argument} requires a tool name"
@@ -327,9 +363,10 @@ parse_group_arguments() {
 
 resolve_paths() {
   workdir="$(pwd -P)" || return
-  image="${DOCKERED_CLAUDE_IMAGE:-dockered-claude:latest}"
-  # The image containers run, which ensure_packages_image may change.
-  container_image="${image}"
+  if [[ -n "${DOCKERED_CLAUDE_IMAGE+defined}" ]]; then
+    warn "DOCKERED_CLAUDE_IMAGE is no longer used;" \
+      "select an image with --profile or DOCKERED_CLAUDE_PROFILE"
+  fi
   uid_host="$(id -u)" || return
   gid_host="$(id -g)" || return
   username="$(id -un)" || return
@@ -345,6 +382,44 @@ resolve_paths() {
   agents_dir="${HOME:?}/.agents"
   config_dir="${HOME:?}/.config/claude"
   git_config_dir="${HOME:?}/.config/git"
+}
+
+# Choose the profile from --profile,
+# else from the project configuration,
+# else from DOCKERED_CLAUDE_PROFILE, else default,
+# and set profile, image and container_image for it.
+select_profile() {
+  declare name="${kwargs[profile]:-${project_options[profile]:-${DOCKERED_CLAUDE_PROFILE:-default}}}"
+  validate_profile_name "${name}" || return
+  check_profile_defined "${name}" || return
+  set_profile "${name}"
+}
+
+# Set profile to name, image to its image,
+# and container_image, the image containers run,
+# which ensure_packages_image may change, to the same.
+set_profile() {
+  declare name="$1"
+  profile="${name}"
+  image="dockered-claude-${profile}:latest"
+  container_image="${image}"
+}
+
+# Profile names become path components and part of image names.
+validate_profile_name() {
+  declare name="$1"
+  if [[ ! "${name}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+    warn "invalid profile name '${name}'"
+    return 1
+  fi
+}
+
+check_profile_defined() {
+  declare name="$1"
+  [[ -f "${project_directory}/profiles/${name}/Dockerfile" ]] && return 0
+  warn "no profile '${name}':" \
+    "${project_directory}/profiles/${name}/Dockerfile is missing"
+  return 1
 }
 
 # Choose the tools from --tool and --no-tools,
@@ -592,7 +667,7 @@ read_project_config() {
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
     case "${key}" in
-    tools | packages) ;;
+    profile | tools | packages) ;;
     mount)
       if ! validate_mount_spec "${value}"; then
         warn "${project_config}:${number}: invalid mount"
@@ -619,6 +694,9 @@ read_project_config() {
 # so that a misspelt package, which only the build reveals, is not saved.
 save_project_options() {
   [[ -z "${kwargs[no_save]+defined}" ]] || return 0
+  if [[ -n "${kwargs[profile]+defined}" ]]; then
+    save_project_option profile "${kwargs[profile]}" || return
+  fi
   if [[ -n "${kwargs[tools_given]+defined}" ]]; then
     declare tool
     for tool in "${tools[@]}"; do
@@ -765,6 +843,20 @@ list_tools() {
       printf '%s\n' "${tool}"
     else
       printf '%s (not built)\n' "${tool}"
+    fi
+  done
+}
+
+list_profiles() {
+  declare entry profile image container_image
+  for entry in "${project_directory}"/profiles/*/Dockerfile; do
+    [[ -f "${entry}" ]] || continue
+    entry="${entry%/Dockerfile}"
+    set_profile "${entry##*/}"
+    if image_exists; then
+      printf '%s\n' "${profile}"
+    else
+      printf '%s (not built)\n' "${profile}"
     fi
   done
 }
@@ -928,11 +1020,13 @@ image_exists() {
   docker image inspect "${image}" >/dev/null 2>&1
 }
 
+# Build the image of profile from its directory.
 build_image() {
   docker build \
+    --label "dockered-claude.profile=${profile}" \
     --pull \
     --tag "${image}" \
-    "${project_directory}/profiles/default" || return
+    "${project_directory}/profiles/${profile}" || return
 }
 
 ensure_image() {
@@ -944,10 +1038,13 @@ ensure_image() {
 # tagged by a hash of their sorted names
 # so that projects with the same packages share it.
 # Build it with the build command, when it is missing,
-# or when it was built from another base image.
+# or when it was built from another base image,
+# from the profile's own Dockerfile.packages if it has one.
 ensure_packages_image() {
   ((${#packages[@]} > 0)) || return 0
   declare repository="${image}" names hash base_id built_from
+  declare file="${project_directory}/profiles/${profile}/Dockerfile.packages"
+  [[ -f "${file}" ]] || file="${project_directory}/Dockerfile.packages"
   # Drop the tag, but not a registry port (e.g. host:5000/name).
   [[ "${repository##*/}" != *:* ]] || repository="${repository%:*}"
   names="$(printf '%s\n' "${packages[@]}" | sort -u | paste -s -d ' ')" || return
@@ -967,9 +1064,10 @@ ensure_packages_image() {
     --build-arg "BASE_IMAGE=${image}" \
     --build-arg "BASE_IMAGE_ID=${base_id}" \
     --build-arg "PACKAGES=${names}" \
-    --file "${project_directory}/Dockerfile.packages" \
+    --file "${file}" \
+    --label "dockered-claude.profile=${profile}" \
     --tag "${container_image}" \
-    "${project_directory}" || return
+    "${file%/*}" || return
 }
 
 # The docker run arguments of Claude Code's container.
@@ -1194,12 +1292,13 @@ run_container() {
   exec docker "${docker_args[@]}" "${container_image}" "$@"
 }
 
-# Rebuild the base image,
+# Rebuild the image of the project's profile,
 # and the packages image of the project's saved packages.
 build_images() {
-  build_image || return
   find_project_config || return
   read_project_config || return
+  select_profile || return
+  build_image || return
   select_packages || return
   ensure_packages_image || return
 }
@@ -1210,11 +1309,11 @@ build_images() {
 run() {
   declare image workdir state_dir state_home uid_host gid_host username groupname
   declare home passwd_file group_file agents_dir config_dir git_config_dir
-  declare project_config project_root container_image
+  declare project_config project_root profile container_image
   declare -a project_mounts=() mount_paths=()
   declare -A project_options=() mount_modes=()
 
-  declare tool
+  declare name
 
   resolve_paths || return
   case "${kwargs[command]}" in
@@ -1222,14 +1321,27 @@ run() {
     build_images
     return
     ;;
+  profile-list)
+    list_profiles
+    return
+    ;;
+  profile-build)
+    for name in "${args[@]}"; do
+      check_profile_defined "${name}" || return
+      set_profile "${name}"
+      build_image || return
+    done
+    return
+    ;;
   tool-list)
     list_tools
     return
     ;;
   tool-build)
+    select_profile || return
     ensure_image || return
-    for tool in "${args[@]}"; do
-      build_tool_volume "${tool}" refresh || return
+    for name in "${args[@]}"; do
+      build_tool_volume "${name}" refresh || return
     done
     return
     ;;
@@ -1239,6 +1351,7 @@ run() {
   find_project_config || return
   project_root="${project_config%/"${project_config_path}"}"
   read_project_config || return
+  select_profile || return
   select_tools || return
   select_packages || return
   select_mounts || return

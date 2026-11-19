@@ -212,10 +212,58 @@ test_tool_requires_a_known_subcommand() {
 
 test_help_is_accepted_after_a_command() {
   declare command
-  for command in run build tool; do
+  for command in run build profile tool; do
     reset_arguments
     capture parse_arguments "${command}" --help
     assert_status 0
     assert_equal 1 "${kwargs[help]}"
   done
+}
+
+test_profile_is_set() {
+  reset_arguments
+  capture parse_arguments --profile minimal
+  assert_status 0
+  assert_equal minimal "${kwargs[profile]}"
+}
+
+test_profile_requires_a_name() {
+  reset_arguments
+  capture parse_arguments --profile
+  assert_status 1
+  assert_contains "${errors}" '--profile requires a profile name'
+}
+
+test_invalid_profile_name_is_refused() {
+  reset_arguments
+  capture parse_arguments --profile Default
+  assert_status 1
+  assert_contains "${errors}" "invalid profile name 'Default'"
+}
+
+test_profile_list() {
+  reset_arguments
+  capture parse_arguments profile list
+  assert_status 0
+  assert_equal profile-list "${kwargs[command]}"
+}
+
+test_profile_build_takes_names() {
+  reset_arguments
+  capture parse_arguments profile build default minimal
+  assert_status 0
+  assert_equal profile-build "${kwargs[command]}"
+  assert_array args default minimal
+}
+
+test_profile_build_requires_a_valid_name() {
+  reset_arguments
+  capture parse_arguments profile build
+  assert_status 1
+  assert_contains "${errors}" 'profile build requires a profile name'
+
+  reset_arguments
+  capture parse_arguments profile build ../escape
+  assert_status 1
+  assert_contains "${errors}" "invalid profile name '../escape'"
 }
